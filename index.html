@@ -1,0 +1,1985 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoneyMap — Controle Financeiro</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+        import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
+            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+        import { getFirestore, collection, doc, addDoc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, query, orderBy }
+            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDnoU5wPBtaCsPIxJm2kmEPJMWFfRzmNss",
+            authDomain: "benicio-eduardo.firebaseapp.com",
+            projectId: "benicio-eduardo",
+            storageBucket: "benicio-eduardo.firebasestorage.app",
+            messagingSenderId: "288412000565",
+            appId: "1:288412000565:web:5ee4c92cd5f00c0ddbac7c"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const provider = new GoogleAuthProvider();
+
+        let currentUser = null;
+        let lancamentos = [];
+        let contas = [];
+        let dividas = [];
+        let recorrentes = [];
+        let metas = {};
+        let configApp = { senhaHash: '', patrimonioLock: true };
+        let filtroAtivo = 'todos';
+        let editandoId = null;
+        let chartMensal, chartPatrimonio, chartCategorias, chartScore;
+        let patrimonioDesbloqueado = false;
+        let pinBuffer = '';
+
+        const MESES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+        const MESES_CURTOS = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+        const CATEGORIAS_ENTRADA = ['receita','transferência'];
+        const CATEGORIAS_SAIDA = ['gasto fixo','gasto variável','lazer','investimento','transferência'];
+
+        // ===== UTILS =====
+        function escapeHtml(str){if(!str)return'';return str.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+        function fmt(v){return v.toLocaleString('pt-BR',{style:'currency',currency:'BRL'});}
+        function toast(msg,type='success'){
+            const div=document.createElement('div');div.className='toast';
+            div.style.borderLeftColor=type==='success'?'var(--accent)':type==='warning'?'var(--amber)':'var(--red)';
+            div.innerHTML=`<i class="fa-solid ${type==='success'?'fa-circle-check':type==='warning'?'fa-triangle-exclamation':'fa-circle-exclamation'}" style="color:${type==='success'?'var(--accent)':type==='warning'?'var(--amber)':'var(--red)'}"></i> ${msg}`;
+            document.body.appendChild(div);setTimeout(()=>div.remove(),3500);
+        }
+        function loading(show){document.getElementById('loadingBar').style.display=show?'block':'none';}
+        window.fmt=fmt; window.toast=toast;
+
+        // ===== AUTH =====
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUser = user;
+                document.getElementById('telaLogin').style.display = 'none';
+                document.getElementById('telaApp').style.display = 'block';
+                document.getElementById('userAvatar').src = user.photoURL || '';
+                document.getElementById('userName').innerText = user.displayName || user.email;
+                document.getElementById('userEmail').innerText = user.email;
+                loading(true);
+                await Promise.all([carregarLancamentos(), carregarContas(), carregarDividas(), carregarRecorrentes(), carregarMetas(), carregarConfig()]);
+                loading(false);
+                // Se tem senha configurada, pede PIN após login
+                if(configApp.senhaHash) {
+                    mostrarPinLogin();
+                } else {
+                    renderizarTudo();
+                    aplicarVisibilidadeSaldos();
+                }
+            } else {
+                currentUser = null; lancamentos = []; contas = []; dividas = []; recorrentes = []; metas = {};
+                document.getElementById('telaLogin').style.display = 'flex';
+                document.getElementById('telaApp').style.display = 'none';
+            }
+        });
+
+        window.fazerLogin = async () => {
+            try {
+                document.getElementById('btnLogin').disabled = true;
+                document.getElementById('btnLogin').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Entrando...';
+                await signInWithPopup(auth, provider);
+            } catch(e) {
+                toast('Erro ao fazer login.','error');
+                document.getElementById('btnLogin').disabled = false;
+                document.getElementById('btnLogin').innerHTML = '<img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20"> Entrar com Google';
+            }
+        };
+        window.fazerLogout = async () => {
+            if(confirm('Deseja sair?')){ await signOut(auth); }
+        };
+
+        // ===== FIRESTORE REFS =====
+        const ref = (col) => collection(db, 'usuarios', currentUser.uid, col);
+        const docRef = (col, id) => doc(db, 'usuarios', currentUser.uid, col, id);
+
+        // ===== CARREGAR DADOS =====
+        async function carregarLancamentos() {
+            try {
+                const q = query(ref('lancamentos'), orderBy('dataEvento','desc'));
+                const snap = await getDocs(q);
+                lancamentos = snap.docs.map(d => ({id:d.id,...d.data()}));
+            } catch(e) { toast('Erro ao carregar lançamentos.','error'); }
+        }
+        async function carregarContas() {
+            try {
+                const snap = await getDocs(ref('contas'));
+                contas = snap.docs.map(d => ({id:d.id,...d.data()}));
+            } catch(e) {}
+        }
+        async function carregarDividas() {
+            try {
+                const snap = await getDocs(ref('dividas'));
+                dividas = snap.docs.map(d => ({id:d.id,...d.data()}));
+            } catch(e) {}
+        }
+        async function carregarRecorrentes() {
+            try {
+                const snap = await getDocs(ref('recorrentes'));
+                recorrentes = snap.docs.map(d => ({id:d.id,...d.data()}));
+            } catch(e) {}
+        }
+        async function carregarMetas() {
+            try {
+                const snap = await getDoc(docRef('config','metas'));
+                metas = snap.exists() ? snap.data() : { reserva: 0, objetivos: [] };
+            } catch(e) { metas = { reserva: 0, objetivos: [] }; }
+        }
+        async function carregarConfig() {
+            try {
+                const snap = await getDoc(docRef('config','app'));
+                if(snap.exists()) configApp = snap.data();
+            } catch(e) {}
+        }
+
+        // ===== LANÇAMENTOS CRUD =====
+        window.adicionarLancamento = async () => {
+            const descricao = document.getElementById('descricao').value.trim();
+            const valor = parseFloat(document.getElementById('valor').value);
+            const tipo = document.getElementById('tipo').value;
+            const categoria = document.getElementById('categoria').value;
+            const contaId = document.getElementById('contaLanc').value;
+            let dataEvento = document.getElementById('dataEvento').value;
+            if (!descricao){ toast('Descrição obrigatória','error'); return; }
+            if (isNaN(valor)||valor<=0){ toast('Valor inválido','error'); return; }
+            if (!dataEvento) dataEvento = new Date().toISOString().slice(0,10);
+            const btn = document.querySelector('.btn-add');
+            btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+            try {
+                const novo = {descricao, valor, tipo, categoria, contaId: contaId||'', dataEvento, criadoEm: new Date().toISOString()};
+                const dr = await addDoc(ref('lancamentos'), novo);
+                lancamentos.unshift({id:dr.id,...novo});
+                // Compensação automática de conta
+                if(contaId) await compensarConta(contaId, valor, tipo);
+                document.getElementById('descricao').value='';
+                document.getElementById('valor').value='';
+                document.getElementById('dataEvento').value=new Date().toISOString().slice(0,10);
+                renderizarTudo();
+                toast('Lançamento adicionado!');
+                verificarAlertas();
+            } catch(e){ toast('Erro ao salvar.','error'); }
+            btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-plus"></i> Adicionar';
+        };
+
+        window.excluirLancamento = async (id) => {
+            if(!confirm('Excluir este lançamento?')) return;
+            try {
+                const item = lancamentos.find(l=>l.id===id);
+                await deleteDoc(docRef('lancamentos', id));
+                // Desfaz compensação
+                if(item&&item.contaId) await compensarConta(item.contaId, item.valor, item.tipo==='entrada'?'saida':'entrada');
+                lancamentos = lancamentos.filter(l=>l.id!==id);
+                renderizarTudo(); toast('Removido!');
+            } catch(e){ toast('Erro ao remover.','error'); }
+        };
+
+        // Função de compensação automática
+        async function compensarConta(contaId, valor, tipo) {
+            const conta = contas.find(c=>c.id===contaId); if(!conta) return;
+            const novoSaldo = tipo==='entrada' ? conta.saldo+valor : conta.saldo-valor;
+            await updateDoc(docRef('contas', contaId), {saldo: novoSaldo});
+            conta.saldo = novoSaldo;
+        }
+
+        window.abrirModalEditar = (id) => {
+            const item = lancamentos.find(l=>l.id===id); if(!item) return;
+            editandoId = id;
+            document.getElementById('editDescricao').value = item.descricao;
+            document.getElementById('editValor').value = item.valor;
+            document.getElementById('editTipo').value = item.tipo;
+            carregarCategoriasEdit();
+            document.getElementById('editCategoria').value = item.categoria;
+            document.getElementById('editDataEvento').value = item.dataEvento;
+            preencherSelectContas('editContaLanc', item.contaId||'');
+            document.getElementById('modalEditar').classList.remove('hidden');
+        };
+        window.salvarEdicao = async () => {
+            const descricao = document.getElementById('editDescricao').value.trim();
+            const valor = parseFloat(document.getElementById('editValor').value);
+            const tipo = document.getElementById('editTipo').value;
+            const categoria = document.getElementById('editCategoria').value;
+            const dataEvento = document.getElementById('editDataEvento').value;
+            const contaId = document.getElementById('editContaLanc').value;
+            if(!descricao){ toast('Descrição obrigatória','error'); return; }
+            if(isNaN(valor)||valor<=0){ toast('Valor inválido','error'); return; }
+            const btn = document.getElementById('btnSalvarEdicao');
+            btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Salvando...';
+            try {
+                const itemAntigo = lancamentos.find(l=>l.id===editandoId);
+                // Desfaz compensação anterior
+                if(itemAntigo&&itemAntigo.contaId) await compensarConta(itemAntigo.contaId, itemAntigo.valor, itemAntigo.tipo==='entrada'?'saida':'entrada');
+                await updateDoc(docRef('lancamentos', editandoId), {descricao,valor,tipo,categoria,dataEvento,contaId:contaId||''});
+                const idx = lancamentos.findIndex(l=>l.id===editandoId);
+                if(idx!==-1) lancamentos[idx]={...lancamentos[idx],descricao,valor,tipo,categoria,dataEvento,contaId:contaId||''};
+                // Aplica nova compensação
+                if(contaId) await compensarConta(contaId, valor, tipo);
+                renderizarTudo(); toast('Atualizado!'); fecharModalEditar();
+            } catch(e){ toast('Erro ao atualizar.','error'); }
+            btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-check"></i> Salvar';
+        };
+        window.fecharModalEditar = () => { document.getElementById('modalEditar').classList.add('hidden'); editandoId=null; };
+
+        // ===== CONTAS CRUD =====
+        window.abrirModalConta = (id=null) => {
+            if(id) {
+                const c = contas.find(c=>c.id===id); if(!c) return;
+                document.getElementById('contaNome').value=c.nome;
+                document.getElementById('contaTipo').value=c.tipo;
+                document.getElementById('contaSaldo').value=c.saldo;
+                document.getElementById('contaLimite').value=c.limite||'';
+                document.getElementById('contaVencimento').value=c.vencimento||'';
+                document.getElementById('contaFechamento').value=c.fechamento||'';
+                document.getElementById('contaComprometida').checked=c.comprometida||false;
+                document.getElementById('contaValorComprometido').value=c.valorComprometido||'';
+                document.getElementById('contaLimiteRow').style.display=c.tipo==='cartao'?'flex':'none';
+                document.getElementById('contaCartaoRows').style.display=c.tipo==='cartao'?'flex':'none';
+                document.getElementById('btnExcluirConta').style.display='inline-flex';
+                document.getElementById('btnExcluirConta').onclick=()=>excluirConta(id);
+                document.getElementById('modalContaTitulo').innerText='Editar Conta';
+                document.getElementById('modalConta').dataset.editId=id;
+            } else {
+                document.getElementById('contaNome').value='';
+                document.getElementById('contaTipo').value='corrente';
+                document.getElementById('contaSaldo').value='';
+                document.getElementById('contaLimite').value='';
+                document.getElementById('contaVencimento').value='';
+                document.getElementById('contaComprometida').checked=false;
+                document.getElementById('contaValorComprometido').value='';
+                document.getElementById('contaFechamento').value='';
+                document.getElementById('contaLimiteRow').style.display='none';
+                document.getElementById('contaCartaoRows').style.display='none';
+                document.getElementById('btnExcluirConta').style.display='none';
+                document.getElementById('modalContaTitulo').innerText='Nova Conta';
+                document.getElementById('modalConta').dataset.editId='';
+            }
+            document.getElementById('modalConta').classList.remove('hidden');
+        };
+        window.fecharModalConta = () => document.getElementById('modalConta').classList.add('hidden');
+        window.onChangeTipoConta = () => {
+            const t = document.getElementById('contaTipo').value;
+            document.getElementById('contaLimiteRow').style.display=t==='cartao'?'flex':'none';
+            document.getElementById('contaCartaoRows').style.display=t==='cartao'?'flex':'none';
+        };
+        window.salvarConta = async () => {
+            const nome=document.getElementById('contaNome').value.trim();
+            const tipo=document.getElementById('contaTipo').value;
+            const saldo=parseFloat(document.getElementById('contaSaldo').value)||0;
+            const limite=parseFloat(document.getElementById('contaLimite').value)||0;
+            const vencimento=parseInt(document.getElementById('contaVencimento').value)||0;
+            const fechamento=parseInt(document.getElementById('contaFechamento').value)||0;
+            const comprometida=document.getElementById('contaComprometida').checked;
+            const valorComprometido=parseFloat(document.getElementById('contaValorComprometido').value)||0;
+            if(!nome){ toast('Nome obrigatório','error'); return; }
+            const editId = document.getElementById('modalConta').dataset.editId;
+            const dados={nome,tipo,saldo,limite,vencimento,fechamento,comprometida,valorComprometido};
+            try {
+                if(editId) {
+                    await updateDoc(docRef('contas',editId),dados);
+                    const idx=contas.findIndex(c=>c.id===editId);
+                    if(idx!==-1) contas[idx]={...contas[idx],...dados};
+                } else {
+                    const dr=await addDoc(ref('contas'),{...dados,criadoEm:new Date().toISOString()});
+                    contas.push({id:dr.id,...dados});
+                }
+                fecharModalConta(); renderizarContas(); renderizarTudo(); toast('Conta salva!');
+            } catch(e){ toast('Erro ao salvar conta.','error'); }
+        };
+        async function excluirConta(id) {
+            if(!confirm('Excluir esta conta?')) return;
+            try {
+                await deleteDoc(docRef('contas',id));
+                contas=contas.filter(c=>c.id!==id);
+                fecharModalConta(); renderizarContas(); toast('Conta removida!');
+            } catch(e){ toast('Erro.','error'); }
+        }
+
+        // ===== DÍVIDAS CRUD =====
+        window.abrirModalDivida = (id=null) => {
+            if(id) {
+                const d=dividas.find(d=>d.id===id); if(!d) return;
+                document.getElementById('dividaNome').value=d.nome;
+                document.getElementById('dividaTotal').value=d.total;
+                document.getElementById('dividaParcela').value=d.parcela;
+                document.getElementById('dividaParcelas').value=d.parcelas;
+                document.getElementById('dividaParcelasRestantes').value=d.parcelasRestantes;
+                document.getElementById('dividaJuros').value=d.juros||0;
+                document.getElementById('btnExcluirDivida').style.display='inline-flex';
+                document.getElementById('btnExcluirDivida').onclick=()=>excluirDivida(id);
+                document.getElementById('modalDividaTitulo').innerText='Editar Dívida';
+                document.getElementById('modalDivida').dataset.editId=id;
+            } else {
+                ['dividaNome','dividaTotal','dividaParcela','dividaParcelas','dividaParcelasRestantes'].forEach(i=>document.getElementById(i).value='');
+                document.getElementById('dividaJuros').value=0;
+                document.getElementById('btnExcluirDivida').style.display='none';
+                document.getElementById('modalDividaTitulo').innerText='Nova Dívida';
+                document.getElementById('modalDivida').dataset.editId='';
+            }
+            document.getElementById('modalDivida').classList.remove('hidden');
+        };
+        window.fecharModalDivida = () => document.getElementById('modalDivida').classList.add('hidden');
+        window.salvarDivida = async () => {
+            const nome=document.getElementById('dividaNome').value.trim();
+            const total=parseFloat(document.getElementById('dividaTotal').value)||0;
+            const parcela=parseFloat(document.getElementById('dividaParcela').value)||0;
+            const parcelas=parseInt(document.getElementById('dividaParcelas').value)||0;
+            const parcelasRestantes=parseInt(document.getElementById('dividaParcelasRestantes').value)||0;
+            const juros=parseFloat(document.getElementById('dividaJuros').value)||0;
+            if(!nome||!total){ toast('Preencha nome e valor','error'); return; }
+            const editId=document.getElementById('modalDivida').dataset.editId;
+            try {
+                if(editId) {
+                    await updateDoc(docRef('dividas',editId),{nome,total,parcela,parcelas,parcelasRestantes,juros});
+                    const idx=dividas.findIndex(d=>d.id===editId);
+                    if(idx!==-1) dividas[idx]={...dividas[idx],nome,total,parcela,parcelas,parcelasRestantes,juros};
+                } else {
+                    const dr=await addDoc(ref('dividas'),{nome,total,parcela,parcelas,parcelasRestantes,juros,criadoEm:new Date().toISOString()});
+                    dividas.push({id:dr.id,nome,total,parcela,parcelas,parcelasRestantes,juros});
+                }
+                fecharModalDivida(); renderizarDividas(); calcularScore(); toast('Dívida salva!');
+            } catch(e){ toast('Erro.','error'); }
+        };
+        async function excluirDivida(id) {
+            if(!confirm('Excluir esta dívida?')) return;
+            try {
+                await deleteDoc(docRef('dividas',id));
+                dividas=dividas.filter(d=>d.id!==id);
+                fecharModalDivida(); renderizarDividas(); calcularScore(); toast('Removida!');
+            } catch(e){ toast('Erro.','error'); }
+        }
+
+        // ===== RECORRENTES CRUD =====
+        window.abrirModalRecorrente = (id=null) => {
+            if(id) {
+                const r=recorrentes.find(r=>r.id===id); if(!r) return;
+                document.getElementById('recNome').value=r.nome;
+                document.getElementById('recValor').value=r.valor;
+                document.getElementById('recTipo').value=r.tipo;
+                document.getElementById('recCategoria').value=r.categoria;
+                document.getElementById('recDia').value=r.dia;
+                document.getElementById('btnExcluirRec').style.display='inline-flex';
+                document.getElementById('btnExcluirRec').onclick=()=>excluirRecorrente(id);
+                document.getElementById('modalRecTitulo').innerText='Editar Recorrente';
+                document.getElementById('modalRec').dataset.editId=id;
+            } else {
+                ['recNome','recValor','recDia'].forEach(i=>document.getElementById(i).value='');
+                document.getElementById('recTipo').value='saida';
+                document.getElementById('recCategoria').value='gasto fixo';
+                document.getElementById('btnExcluirRec').style.display='none';
+                document.getElementById('modalRecTitulo').innerText='Novo Lançamento Recorrente';
+                document.getElementById('modalRec').dataset.editId='';
+            }
+            document.getElementById('modalRec').classList.remove('hidden');
+        };
+        window.fecharModalRec = () => document.getElementById('modalRec').classList.add('hidden');
+        window.salvarRecorrente = async () => {
+            const nome=document.getElementById('recNome').value.trim();
+            const valor=parseFloat(document.getElementById('recValor').value)||0;
+            const tipo=document.getElementById('recTipo').value;
+            const categoria=document.getElementById('recCategoria').value;
+            const dia=parseInt(document.getElementById('recDia').value)||1;
+            if(!nome||!valor){ toast('Preencha nome e valor','error'); return; }
+            const editId=document.getElementById('modalRec').dataset.editId;
+            try {
+                if(editId) {
+                    await updateDoc(docRef('recorrentes',editId),{nome,valor,tipo,categoria,dia});
+                    const idx=recorrentes.findIndex(r=>r.id===editId);
+                    if(idx!==-1) recorrentes[idx]={...recorrentes[idx],nome,valor,tipo,categoria,dia};
+                } else {
+                    const dr=await addDoc(ref('recorrentes'),{nome,valor,tipo,categoria,dia,criadoEm:new Date().toISOString()});
+                    recorrentes.push({id:dr.id,nome,valor,tipo,categoria,dia});
+                }
+                fecharModalRec(); renderizarRecorrentes(); atualizarProjecao(); toast('Salvo!');
+            } catch(e){ toast('Erro.','error'); }
+        };
+        async function excluirRecorrente(id) {
+            if(!confirm('Excluir?')) return;
+            try {
+                await deleteDoc(docRef('recorrentes',id));
+                recorrentes=recorrentes.filter(r=>r.id!==id);
+                fecharModalRec(); renderizarRecorrentes(); atualizarProjecao(); toast('Removido!');
+            } catch(e){ toast('Erro.','error'); }
+        }
+
+        // ===== METAS/OBJETIVOS =====
+        window.salvarMetas = async () => {
+            const reserva = parseFloat(document.getElementById('metaReserva').value)||0;
+            const obj = [];
+            document.querySelectorAll('.objetivo-item').forEach(el=>{
+                const nome=el.querySelector('.obj-nome').value.trim();
+                const valor=parseFloat(el.querySelector('.obj-valor').value)||0;
+                const prazo=parseInt(el.querySelector('.obj-prazo').value)||0;
+                if(nome&&valor) obj.push({nome,valor,prazo});
+            });
+            try {
+                await setDoc(docRef('config','metas'),{reserva,objetivos:obj});
+                metas={reserva,objetivos:obj};
+                renderizarObjetivos(); calcularScore(); toast('Metas salvas!');
+            } catch(e){ toast('Erro.','error'); }
+        };
+        window.adicionarObjetivoItem = () => {
+            const container=document.getElementById('objetivosContainer');
+            const div=document.createElement('div'); div.className='objetivo-item';
+            div.style.cssText='display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:8px;align-items:end;margin-bottom:8px;';
+            div.innerHTML=`<input class="obj-nome" placeholder="Ex: Viagem, Carro..." style="height:36px;">
+            <input class="obj-valor" type="number" placeholder="Valor R$" style="height:36px;">
+            <input class="obj-prazo" type="number" placeholder="Meses" style="height:36px;">
+            <button onclick="this.parentElement.remove()" style="height:36px;width:36px;border:1px solid var(--red);background:var(--red-light);color:var(--red);border-radius:var(--radius-sm);cursor:pointer;"><i class="fa-solid fa-trash"></i></button>`;
+            container.appendChild(div);
+        };
+
+        // ===== FILTROS =====
+        window.renderizarTabela = renderizarTabela;
+        window.filtrarLancamentos = (tipo) => {
+            filtroAtivo=tipo;
+            document.querySelectorAll('.filtro-chip').forEach(b=>b.classList.remove('active'));
+            document.querySelector(`.filtro-chip[data-filtro="${tipo}"]`).classList.add('active');
+            renderizarTabela();
+        };
+        function getLancamentosFiltrados() {
+            let lista=[...lancamentos];
+            if(filtroAtivo!=='todos') lista=lista.filter(l=>l.tipo===filtroAtivo);
+            const cat=document.getElementById('filtroCategoria')?.value;
+            if(cat&&cat!=='todas') lista=lista.filter(l=>l.categoria===cat);
+            const ano=document.getElementById('filtroAno')?.value;
+            if(ano&&ano!=='todos') lista=lista.filter(l=>new Date(l.dataEvento+'T00:00:00').getFullYear()==ano);
+            return lista;
+        }
+
+        // ===== CÁLCULOS =====
+        function calcularTotais() {
+            let entradas=0,saidas=0;
+            lancamentos.forEach(l=>{if(l.tipo==='entrada')entradas+=l.valor;else saidas+=l.valor;});
+            return {entradas,saidas,saldo:entradas-saidas};
+        }
+        function obterDadosMes(ano,mes) {
+            const lst=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano&&new Date(l.dataEvento+'T00:00:00').getMonth()===mes);
+            const receita=lst.filter(l=>l.tipo==='entrada'&&l.categoria==='receita').reduce((a,b)=>a+b.valor,0);
+            const gastoFixo=lst.filter(l=>l.tipo==='saida'&&l.categoria==='gasto fixo').reduce((a,b)=>a+b.valor,0);
+            const gastoVariavel=lst.filter(l=>l.tipo==='saida'&&l.categoria==='gasto variável').reduce((a,b)=>a+b.valor,0);
+            const lazer=lst.filter(l=>l.tipo==='saida'&&l.categoria==='lazer').reduce((a,b)=>a+b.valor,0);
+            const investimento=lst.filter(l=>l.tipo==='saida'&&l.categoria==='investimento').reduce((a,b)=>a+b.valor,0);
+            return {receita,gastoFixo,gastoVariavel,lazer,investimento};
+        }
+        function mediaUltimosMeses(n=3) {
+            const hoje=new Date();
+            let totalReceita=0,totalSaida=0,mesesComDados=0;
+            // Tenta os n meses anteriores primeiro
+            for(let i=1;i<=n;i++) {
+                const d=new Date(hoje.getFullYear(),hoje.getMonth()-i,1);
+                const {receita,gastoFixo,gastoVariavel,lazer,investimento}=obterDadosMes(d.getFullYear(),d.getMonth());
+                const saida=gastoFixo+gastoVariavel+lazer+investimento;
+                if(receita||saida){totalReceita+=receita;totalSaida+=saida;mesesComDados++;}
+            }
+            // Se não há dados anteriores, usa o mês atual como base
+            if(!mesesComDados) {
+                const {receita,gastoFixo,gastoVariavel,lazer,investimento}=obterDadosMes(hoje.getFullYear(),hoje.getMonth());
+                const saida=gastoFixo+gastoVariavel+lazer+investimento;
+                if(receita||saida){totalReceita=receita;totalSaida=saida;mesesComDados=1;}
+            }
+            if(!mesesComDados) return {receita:0,saida:0};
+            return {receita:totalReceita/mesesComDados,saida:totalSaida/mesesComDados};
+        }
+
+        // ===== SCORE FINANCEIRO =====
+        function calcularScore() {
+            const hoje=new Date();
+            const {receita,gastoFixo,gastoVariavel,lazer,investimento}=obterDadosMes(hoje.getFullYear(),hoje.getMonth());
+            const nec=gastoFixo+gastoVariavel;
+            const totalSaida=nec+lazer+investimento;
+            const {saida:mediaSaida}=mediaUltimosMeses(3);
+            const totalDividas=dividas.reduce((a,b)=>a+b.parcela,0);
+            let score=0; const criterios=[];
+
+            // 1. Regra 50/30/20
+            if(receita>0){
+                const pctNec=nec/receita*100,pctLazer=lazer/receita*100,pctInvest=investimento/receita*100;
+                const regra=(pctNec<=50?1:0)+(pctLazer<=30?1:0)+(pctInvest>=20?1:0);
+                score+=regra*10;
+                criterios.push({nome:'Regra 50/30/20',pts:regra*10,max:30,ok:regra===3,msg:regra===3?'Todas as metas cumpridas':`${3-regra} meta(s) fora do ideal`});
+            } else {
+                criterios.push({nome:'Regra 50/30/20',pts:0,max:30,ok:false,msg:'Sem receita lançada no mês'});
+            }
+
+            // 2. Reserva de emergência
+            const totalInvestido=lancamentos.filter(l=>l.tipo==='saida'&&l.categoria==='investimento').reduce((a,b)=>a+b.valor,0);
+            const metaReserva=metas.reserva||(mediaSaida*6);
+            const pctReserva=metaReserva>0?Math.min(totalInvestido/metaReserva,1):0;
+            const ptsReserva=Math.round(pctReserva*25);
+            score+=ptsReserva;
+            criterios.push({nome:'Reserva de emergência',pts:ptsReserva,max:25,ok:pctReserva>=1,msg:pctReserva>=1?'Meta atingida!':`${(pctReserva*100).toFixed(0)}% da meta (${fmt(metaReserva)})`});
+
+            // 3. Dívidas
+            const ptsDivida=dividas.length===0?25:Math.max(0,25-dividas.length*5);
+            score+=ptsDivida;
+            criterios.push({nome:'Controle de dívidas',pts:ptsDivida,max:25,ok:dividas.length===0,msg:dividas.length===0?'Sem dívidas cadastradas':`${dividas.length} dívida(s) ativa(s)`});
+
+            // 4. Consistência (lançamentos nos últimos 3 meses)
+            let mesesAtivos=0;
+            for(let i=1;i<=3;i++){const d=new Date(hoje.getFullYear(),hoje.getMonth()-i,1);const {receita:r}=obterDadosMes(d.getFullYear(),d.getMonth());if(r>0)mesesAtivos++;}
+            const ptsConsistencia=mesesAtivos*Math.round(20/3);
+            score+=ptsConsistencia;
+            criterios.push({nome:'Consistência (3 meses)',pts:ptsConsistencia,max:20,ok:mesesAtivos===3,msg:mesesAtivos===3?'Lançamentos em dia':`Dados em ${mesesAtivos} dos últimos 3 meses`});
+
+            score=Math.min(100,score);
+            renderizarScore(score,criterios);
+            return score;
+        }
+
+        function renderizarScore(score,criterios) {
+            const el=document.getElementById('scoreValor');
+            if(!el) return;
+            let cor,emoji,label;
+            if(score>=80){cor='var(--accent)';emoji='🏆';label='Excelente';}
+            else if(score>=60){cor='#3b82f6';emoji='👍';label='Bom';}
+            else if(score>=40){cor='var(--amber)';emoji='⚠️';label='Regular';}
+            else{cor='var(--red)';emoji='❗';label='Crítico';}
+            document.getElementById('scoreValor').innerText=score;
+            document.getElementById('scoreLabel').innerText=`${emoji} ${label}`;
+            document.getElementById('scoreValor').style.color=cor;
+            document.getElementById('scoreArc').style.background=`conic-gradient(${cor} ${score*3.6}deg, var(--border) 0deg)`;
+            const lista=document.getElementById('scoreCriterios');
+            if(lista) lista.innerHTML=criterios.map(c=>`
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);">
+                    <div>
+                        <div style="font-size:13px;font-weight:600;color:var(--text);">${c.ok?'✅':'❌'} ${c.nome}</div>
+                        <div style="font-size:11px;color:var(--text3);margin-top:2px;">${c.msg}</div>
+                    </div>
+                    <div style="font-size:14px;font-weight:700;color:${c.ok?'var(--accent)':'var(--red)'};">${c.pts}/${c.max}</div>
+                </div>`).join('');
+        }
+
+        // ===== PROJEÇÃO =====
+        function atualizarProjecao() {
+            const el=document.getElementById('projecaoContainer'); if(!el) return;
+            const {receita:mediaReceita,saida:mediaSaida}=mediaUltimosMeses(3);
+            // Recorrentes: saídas e entradas separadas
+            const recorrenteSaida=recorrentes.filter(r=>r.tipo==='saida').reduce((a,b)=>a+b.valor,0);
+            const recorrenteEntrada=recorrentes.filter(r=>r.tipo==='entrada').reduce((a,b)=>a+b.valor,0);
+            // Usa o maior entre a média histórica e os recorrentes cadastrados
+            const receitaProj=Math.max(mediaReceita, recorrenteEntrada);
+            const saidaBase=Math.max(mediaSaida, recorrenteSaida);
+            const {saldo}=calcularTotais();
+            const rows=[];
+            const hoje=new Date();
+            let saldoProjetado=saldo;
+            for(let i=1;i<=6;i++){
+                const d=new Date(hoje.getFullYear(),hoje.getMonth()+i,1);
+                const totalParcelas=dividas.reduce((a,b)=>b.parcelasRestantes>0?a+b.parcela:a,0);
+                const saidaProj=saidaBase+totalParcelas;
+                saldoProjetado+=receitaProj-saidaProj;
+                rows.push({mes:`${MESES_CURTOS[d.getMonth()]}/${d.getFullYear()}`,receita:receitaProj,saida:saidaProj,saldo:saldoProjetado});
+            }
+            el.innerHTML=`
+            <div style="margin-bottom:12px;font-size:12px;color:var(--text3);">
+                <i class="fa-solid fa-circle-info"></i> Projeção baseada na média dos últimos 3 meses + lançamentos recorrentes cadastrados.
+            </div>
+            <div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;">
+                <thead><tr>
+                    <th style="padding:10px 14px;text-align:left;background:var(--bg);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text3);border-bottom:1px solid var(--border);">Mês</th>
+                    <th style="padding:10px 14px;text-align:right;background:var(--bg);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text3);border-bottom:1px solid var(--border);">Receita Est.</th>
+                    <th style="padding:10px 14px;text-align:right;background:var(--bg);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text3);border-bottom:1px solid var(--border);">Saída Est.</th>
+                    <th style="padding:10px 14px;text-align:right;background:var(--bg);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text3);border-bottom:1px solid var(--border);">Saldo Projetado</th>
+                    <th style="padding:10px 14px;text-align:left;background:var(--bg);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--text3);border-bottom:1px solid var(--border);">Status</th>
+                </tr></thead>
+                <tbody>${rows.map(r=>`<tr>
+                    <td style="padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;font-weight:600;">${r.mes}</td>
+                    <td style="padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;color:var(--accent);font-weight:600;text-align:right;">${fmt(r.receita)}</td>
+                    <td style="padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;color:var(--red);font-weight:600;text-align:right;">${fmt(r.saida)}</td>
+                    <td style="padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;font-weight:700;text-align:right;color:${r.saldo>=0?'var(--accent)':'var(--red)'};">${fmt(r.saldo)}</td>
+                    <td style="padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;">${r.saldo>=0?'<span class="badge badge-ok">✓ Positivo</span>':'<span class="badge badge-alert">⚠ Déficit</span>'}</td>
+                </tr>`).join('')}</tbody>
+            </table></div>`;
+
+            // Objetivos
+            renderizarObjetivos();
+        }
+
+        function renderizarObjetivos() {
+            const el=document.getElementById('objetivosProjecao'); if(!el) return;
+            if(!metas.objetivos||metas.objetivos.length===0){el.innerHTML='<div style="color:var(--text3);font-size:13px;">Nenhum objetivo cadastrado. Vá em Planejamento → Metas e Objetivos.</div>';return;}
+            const {saldo}=calcularTotais();
+            const {receita:mediaR,saida:mediaS}=mediaUltimosMeses(3);
+            const sobra=mediaR-mediaS;
+            el.innerHTML=metas.objetivos.map(o=>{
+                const mesesNecessarios=sobra>0?Math.ceil(o.valor/sobra):null;
+                const pctAtingido=Math.min((saldo/o.valor)*100,100);
+                return `<div style="background:var(--bg);border-radius:var(--radius-sm);padding:14px;margin-bottom:10px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <div style="font-size:14px;font-weight:700;">🎯 ${escapeHtml(o.nome)}</div>
+                        <div style="font-size:14px;font-weight:700;color:var(--accent);">${fmt(o.valor)}</div>
+                    </div>
+                    <div style="height:8px;background:var(--border);border-radius:999px;margin-bottom:8px;overflow:hidden;">
+                        <div style="height:100%;width:${pctAtingido}%;background:var(--accent);border-radius:999px;"></div>
+                    </div>
+                    <div style="font-size:12px;color:var(--text2);">
+                        ${pctAtingido.toFixed(0)}% do objetivo atingido com saldo atual · 
+                        ${mesesNecessarios?`Estimativa: <strong>${mesesNecessarios} meses</strong> guardando a sobra mensal`:o.prazo?`Meta: ${o.prazo} meses`:'Defina sua sobra mensal para ver estimativa'}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // ===== ALERTAS =====
+        function verificarAlertas() {
+            const hoje=new Date();
+            // Dívidas
+            dividas.forEach(d=>{if(d.parcelasRestantes===1) toast(`⚠️ Última parcela de "${d.nome}" este mês!`,'warning');});
+            // Vencimentos de cartão
+            contas.filter(c=>c.tipo==='cartao'&&c.vencimento).forEach(c=>{
+                if(c.vencimento===hoje.getDate()||c.vencimento===hoje.getDate()+1)
+                    toast(`🔔 Fatura do ${c.nome} vence em breve (dia ${c.vencimento})`,'warning');
+            });
+            // Recorrentes do mês
+            recorrentes.forEach(r=>{
+                if(r.dia===hoje.getDate()) toast(`🔁 Lançamento recorrente de hoje: ${r.nome} (${fmt(r.valor)})`,'warning');
+            });
+        }
+
+        // ===== RENDERIZAÇÃO =====
+        function atualizarSaldo() {
+            const {entradas,saidas,saldo}=calcularTotais();
+            // Patrimônio = APENAS soma dos saldos das contas (não comprometidas)
+            // O saldo dos lançamentos já está refletido nas contas via compensação automática
+            // Se não há contas cadastradas, usa o saldo dos lançamentos como fallback
+            const contasNormais=contas.filter(c=>!c.comprometida&&c.tipo!=='cartao');
+            const totalContas=contasNormais.reduce((a,b)=>a+b.saldo,0);
+            const patrimonio=contas.length>0?totalContas:saldo;
+            // SEMPRE salva os valores reais no mapa
+            valoresOriginais['saldoTotal']=fmt(saldo);
+            valoresOriginais['totalReceitas']=fmt(entradas);
+            valoresOriginais['totalDespesas']=fmt(saidas);
+            valoresOriginais['patrimonioTotal']=fmt(patrimonio);
+            // Atualiza tela respeitando visibilidade
+            if(saldosVisiveis){
+                document.getElementById('saldoTotal').innerText=fmt(saldo);
+                document.getElementById('totalReceitas').innerText=fmt(entradas);
+                document.getElementById('totalDespesas').innerText=fmt(saidas);
+                const el=document.getElementById('patrimonioTotal');
+                if(el) el.innerText=fmt(patrimonio);
+            } else {
+                ['saldoTotal','totalReceitas','totalDespesas','patrimonioTotal'].forEach(id=>{
+                    const el=document.getElementById(id);
+                    if(el) el.innerText='***';
+                });
+            }
+        }
+
+        function renderizarTabela() {
+            const tbody=document.getElementById('corpoTabela');
+            const filtrados=getLancamentosFiltrados();
+            if(filtrados.length===0){tbody.innerHTML='<tr><td colspan="6" class="empty-state"><i class="fa-solid fa-inbox" style="font-size:24px;display:block;margin-bottom:8px;"></i>Nenhum lançamento encontrado</td></tr>';return;}
+            tbody.innerHTML=filtrados.map(l=>{
+                const conta=contas.find(c=>c.id===l.contaId);
+                return `<tr>
+                    <td>${escapeHtml(l.descricao)}</td>
+                    <td><span class="cat-pill">${escapeHtml(l.categoria)}</span></td>
+                    <td class="${l.tipo==='entrada'?'tipo-entrada':'tipo-saida'}">${l.tipo==='entrada'?'+':'−'} ${fmt(l.valor)}</td>
+                    <td>${new Date(l.dataEvento+'T00:00:00').toLocaleDateString('pt-BR')}</td>
+                    <td style="font-size:12px;color:var(--text3);">${conta?conta.nome:'—'}</td>
+                    <td><div class="acoes">
+                        <button onclick="abrirModalEditar('${l.id}')" title="Editar"><i class="fa-solid fa-pen"></i></button>
+                        <button class="del" onclick="excluirLancamento('${l.id}')" title="Excluir"><i class="fa-solid fa-trash"></i></button>
+                    </div></td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderizarContas() {
+            const el=document.getElementById('contasGrid'); if(!el) return;
+            if(contas.length===0){el.innerHTML='<div style="color:var(--text3);font-size:13px;padding:20px 0;">Nenhuma conta cadastrada.</div>';return;}
+            // Separar normais e comprometidas
+            const normais=contas.filter(c=>!c.comprometida);
+            const comprometidas=contas.filter(c=>c.comprometida);
+            const renderCard=(c)=>`
+                <div style="background:var(--bg);border:1px solid ${c.comprometida?'var(--amber)':'var(--border)'};border-radius:var(--radius-sm);padding:16px;cursor:pointer;position:relative;" onclick="abrirModalConta('${c.id}')">
+                    ${c.comprometida?'<div style="position:absolute;top:8px;right:8px;font-size:10px;font-weight:700;background:var(--amber-light);color:var(--amber);padding:2px 8px;border-radius:999px;">COMPROMETIDA</div>':''}
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                        <div>
+                            <div style="font-size:13px;font-weight:700;">${escapeHtml(c.nome)}</div>
+                            <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;">${c.tipo==='corrente'?'Conta Corrente':c.tipo==='poupanca'?'Poupança':c.tipo==='cartao'?'Cartão de Crédito':'Investimento'}</div>
+                        </div>
+                        <div style="font-size:18px;">${c.tipo==='corrente'?'🏦':c.tipo==='poupanca'?'💰':c.tipo==='cartao'?'💳':'📈'}</div>
+                    </div>
+                    <div class="saldo-conta" data-valor="${fmt(c.saldo)}" style="font-size:18px;font-weight:700;color:${c.saldo>=0?'var(--accent)':'var(--red)'};">${saldosVisiveis?fmt(c.saldo):'***'}</div>
+                    ${c.comprometida&&c.valorComprometido?`<div style="font-size:11px;color:var(--amber);margin-top:4px;">🔒 Minha parte: <span class="saldo-comprometida" data-valor="${fmt(c.valorComprometido)}">${saldosVisiveis?fmt(c.valorComprometido):'***'}</span>/mês</div>`:''}
+                    ${c.tipo==='cartao'&&c.limite?`<div style="font-size:11px;color:var(--text3);margin-top:4px;">Limite: ${fmt(c.limite)} · Vence dia ${c.vencimento||'—'}</div>`:''}
+                </div>`;
+            let html='';
+            if(normais.length>0) html+=normais.map(renderCard).join('');
+            if(comprometidas.length>0) html+=`<div style="grid-column:1/-1;margin-top:12px;margin-bottom:4px;font-size:12px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:.04em;">⚠️ Contas Comprometidas — não entram no controle pessoal</div>`+comprometidas.map(renderCard).join('');
+            el.innerHTML=html;
+            // PL pessoal (só contas não comprometidas)
+            const plPessoal=normais.filter(c=>c.tipo!=='cartao').reduce((a,b)=>a+b.saldo,0);
+            valoresOriginais['plPessoal']=fmt(plPessoal);
+            const plEl=document.getElementById('plPessoal');
+            if(plEl) plEl.innerText=saldosVisiveis?fmt(plPessoal):'***';
+            // Aplicar visibilidade nos cards recém-renderizados
+            setTimeout(()=>aplicarVisibilidadeSaldos(),0);
+        }
+
+        function renderizarDividas() {
+            const el=document.getElementById('dividasLista'); if(!el) return;
+            if(dividas.length===0){el.innerHTML='<div style="color:var(--accent);font-size:13px;padding:16px;background:var(--accent-light);border-radius:var(--radius-sm);">🎉 Parabéns! Nenhuma dívida cadastrada.</div>';return;}
+            const totalDevido=dividas.reduce((a,b)=>a+(b.parcela*b.parcelasRestantes),0);
+            const totalJuros=dividas.reduce((a,b)=>a+(b.juros?(b.parcela*b.parcelasRestantes*(b.juros/100)):0),0);
+            el.innerHTML=`
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+                <div style="background:var(--red-light);border-radius:var(--radius-sm);padding:14px;">
+                    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--red);margin-bottom:4px;">Total a Pagar</div>
+                    <div style="font-size:20px;font-weight:700;color:var(--red);">${fmt(totalDevido)}</div>
+                </div>
+                <div style="background:var(--amber-light);border-radius:var(--radius-sm);padding:14px;">
+                    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--amber);margin-bottom:4px;">Total em Juros</div>
+                    <div style="font-size:20px;font-weight:700;color:var(--amber);">${fmt(totalJuros)}</div>
+                </div>
+            </div>
+            ${dividas.map(d=>{
+                const restante=d.parcela*d.parcelasRestantes;
+                const pago=d.total-restante;
+                const pct=Math.max(0,Math.min((pago/d.total)*100,100));
+                return `<div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;margin-bottom:10px;cursor:pointer;" onclick="abrirModalDivida('${d.id}')">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                        <div style="font-size:14px;font-weight:700;">${escapeHtml(d.nome)}</div>
+                        <div style="font-size:13px;color:var(--red);font-weight:700;">${fmt(d.parcela)}/mês</div>
+                    </div>
+                    <div style="height:6px;background:var(--border);border-radius:999px;margin-bottom:8px;overflow:hidden;">
+                        <div style="height:100%;width:${pct}%;background:var(--accent);border-radius:999px;"></div>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text3);">
+                        <span>${d.parcelasRestantes} parcela(s) restante(s)</span>
+                        <span>Restante: ${fmt(restante)}</span>
+                    </div>
+                </div>`;
+            }).join('')}`;
+        }
+
+        function renderizarRecorrentes() {
+            const el=document.getElementById('recorrentesList'); if(!el) return;
+            if(recorrentes.length===0){el.innerHTML='<div style="color:var(--text3);font-size:13px;padding:16px 0;">Nenhum lançamento recorrente cadastrado.</div>';return;}
+            el.innerHTML=recorrentes.map(r=>`
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border);cursor:pointer;" onclick="abrirModalRecorrente('${r.id}')">
+                    <div>
+                        <div style="font-size:13px;font-weight:600;">${escapeHtml(r.nome)}</div>
+                        <div style="font-size:11px;color:var(--text3);">${r.categoria} · Todo dia ${r.dia}</div>
+                    </div>
+                    <div style="font-size:14px;font-weight:700;color:${r.tipo==='entrada'?'var(--accent)':'var(--red)'};">
+                        ${r.tipo==='entrada'?'+':'−'} ${fmt(r.valor)}
+                    </div>
+                </div>`).join('');
+        }
+
+        function preencherSelectContas(selectId, valorAtual='') {
+            const el=document.getElementById(selectId); if(!el) return;
+            el.innerHTML='<option value="">Sem conta vinculada</option>'+contas.map(c=>`<option value="${c.id}" ${valorAtual===c.id?'selected':''}>${escapeHtml(c.nome)}</option>`).join('');
+        }
+
+        // ===== GRÁFICOS =====
+        function getChartColors() {
+            const isDark=document.documentElement.getAttribute('data-theme')==='dark';
+            return {income:isDark?'#10b981':'#059669',expense:isDark?'#f87171':'#dc2626',accent:isDark?'#10b981':'#059669',grid:isDark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)',text:isDark?'#94a3b8':'#64748b'};
+        }
+
+        function atualizarGraficos() {
+            const c=getChartColors();
+            const scaleOpts={x:{grid:{color:c.grid},ticks:{color:c.text}},y:{grid:{color:c.grid},ticks:{color:c.text,callback:v=>'R$'+(v>=1000?(v/1000).toFixed(0)+'k':v)}}};
+            const legendOpts={labels:{color:c.text,font:{size:12}}};
+
+            const meses=MESES_CURTOS;
+            const e=Array(12).fill(0),s=Array(12).fill(0);
+            lancamentos.forEach(l=>{if(!l.dataEvento)return;const m=new Date(l.dataEvento+'T00:00:00').getMonth();if(l.tipo==='entrada')e[m]+=l.valor;else s[m]+=l.valor;});
+            if(chartMensal)chartMensal.destroy();
+            chartMensal=new Chart(document.getElementById('chartMensal'),{type:'bar',data:{labels:meses,datasets:[{label:'Entradas',data:e,backgroundColor:c.income+'99',borderColor:c.income,borderWidth:1.5,borderRadius:4},{label:'Saídas',data:s,backgroundColor:c.expense+'99',borderColor:c.expense,borderWidth:1.5,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:legendOpts,tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${fmt(ctx.raw)}`}}},scales:scaleOpts}});
+
+            let acc=Array(12).fill(0),run=0;
+            for(let i=0;i<12;i++){const ei=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getMonth()===i&&l.tipo==='entrada').reduce((a,b)=>a+b.valor,0);const si=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getMonth()===i&&l.tipo==='saida').reduce((a,b)=>a+b.valor,0);run+=ei-si;acc[i]=run;}
+            if(chartPatrimonio)chartPatrimonio.destroy();
+            chartPatrimonio=new Chart(document.getElementById('chartPatrimonio'),{type:'line',data:{labels:meses,datasets:[{label:'Patrimônio',data:acc,borderColor:c.accent,backgroundColor:c.accent+'18',fill:true,tension:0.4,pointRadius:4,pointBackgroundColor:c.accent}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:legendOpts,tooltip:{callbacks:{label:ctx=>fmt(ctx.raw)}}},scales:scaleOpts}});
+
+            const cats={};lancamentos.forEach(l=>{if(l.tipo==='saida')cats[l.categoria]=(cats[l.categoria]||0)+l.valor;});
+            if(chartCategorias)chartCategorias.destroy();
+            chartCategorias=new Chart(document.getElementById('chartCategorias'),{type:'doughnut',data:{labels:Object.keys(cats),datasets:[{data:Object.values(cats),backgroundColor:['#059669','#f59e0b','#dc2626','#2563eb','#8b5cf6'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{position:'right',labels:{color:c.text,padding:12,font:{size:12}}},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${fmt(ctx.raw)}`}}}}});
+        }
+
+        // ===== REGRA 50/30/20 =====
+        function atualizarAlertaRegra() {
+            const hoje=new Date();
+            const {receita,gastoFixo,gastoVariavel,lazer,investimento}=obterDadosMes(hoje.getFullYear(),hoje.getMonth());
+            const total=receita||1;
+            const nec=gastoFixo+gastoVariavel;
+            const pctNec=(nec/total)*100,pctLazer=(lazer/total)*100,pctInvest=(investimento/total)*100;
+            const bc=(ok)=>ok?'var(--accent)':'var(--amber)';
+            const badge=(ok,msg)=>`<span class="badge ${ok?'badge-ok':'badge-alert'}">${ok?'✓ OK':'⚠ '+msg}</span>`;
+            document.getElementById('alertaRegra').innerHTML=`
+            <div class="rule-row"><div class="rule-header"><div><span class="rule-name">Necessidades</span>${badge(pctNec<=50,'Acima')}</div><span class="rule-pct" style="color:${bc(pctNec<=50)}">${pctNec.toFixed(1)}% <span class="rule-meta">/ meta 50%</span></span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.min(pctNec,100)}%;background:${bc(pctNec<=50)};"></div></div><div style="font-size:11px;color:var(--text3);margin-top:5px;">Fixo: ${fmt(gastoFixo)} · Variável: ${fmt(gastoVariavel)}</div></div>
+            <div class="rule-row"><div class="rule-header"><div><span class="rule-name">Lazer</span>${badge(pctLazer<=30,'Acima')}</div><span class="rule-pct" style="color:${bc(pctLazer<=30)}">${pctLazer.toFixed(1)}% <span class="rule-meta">/ meta 30%</span></span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.min(pctLazer,100)}%;background:${bc(pctLazer<=30)};"></div></div><div style="font-size:11px;color:var(--text3);margin-top:5px;">${fmt(lazer)} gastos com lazer</div></div>
+            <div class="rule-row"><div class="rule-header"><div><span class="rule-name">Investimento</span>${badge(pctInvest>=20,'Abaixo')}</div><span class="rule-pct" style="color:${bc(pctInvest>=20)}">${pctInvest.toFixed(1)}% <span class="rule-meta">/ meta 20%</span></span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.min(pctInvest,100)}%;background:${bc(pctInvest>=20)};"></div></div><div style="font-size:11px;color:var(--text3);margin-top:5px;">${fmt(investimento)} investidos</div></div>`;
+        }
+
+        // ===== COMPARATIVO =====
+        function atualizarComparativo() {
+            const ano=new Date().getFullYear();
+            let rows='';
+            for(let m=0;m<12;m++){
+                const e=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano&&new Date(l.dataEvento+'T00:00:00').getMonth()===m&&l.tipo==='entrada').reduce((a,b)=>a+b.valor,0);
+                const s=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano&&new Date(l.dataEvento+'T00:00:00').getMonth()===m&&l.tipo==='saida').reduce((a,b)=>a+b.valor,0);
+                const saldo=e-s;
+                let varE='—',varS='—';
+                if(m>0){
+                    const ea=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano&&new Date(l.dataEvento+'T00:00:00').getMonth()===m-1&&l.tipo==='entrada').reduce((a,b)=>a+b.valor,0);
+                    const sa=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano&&new Date(l.dataEvento+'T00:00:00').getMonth()===m-1&&l.tipo==='saida').reduce((a,b)=>a+b.valor,0);
+                    if(ea){const v=((e-ea)/ea*100);varE=`<span class="${v>=0?'var-pos':'var-neg'}">${v>=0?'+':''}${v.toFixed(1)}%</span>`;}
+                    if(sa){const v=((s-sa)/sa*100);varS=`<span class="${v<=0?'var-pos':'var-neg'}">${v>=0?'+':''}${v.toFixed(1)}%</span>`;}
+                }
+                rows+=`<tr><td><strong>${MESES_CURTOS[m]}</strong></td><td class="tipo-entrada">${fmt(e)}</td><td class="tipo-saida">${fmt(s)}</td><td style="color:${saldo>=0?'var(--accent)':'var(--red)'};font-weight:700;">${fmt(saldo)}</td><td>${varE}</td><td>${varS}</td></tr>`;
+            }
+            document.getElementById('comparativoMensal').innerHTML=`<table class="comp-table"><thead><tr><th>Mês</th><th>Entradas</th><th>Saídas</th><th>Saldo</th><th>Var. Entradas</th><th>Var. Saídas</th></tr></thead><tbody>${rows}</tbody></table>`;
+        }
+
+        // ===== DRE =====
+        window.atualizarDRE = () => {
+            const tipo=document.getElementById('dreTipoPeriodo').value;
+            let lst=[];
+            if(tipo==='mes'){
+                const mes=parseInt(document.getElementById('dreMes').value)-1;
+                const ano=parseInt(document.getElementById('dreAno').value);
+                if(!ano||isNaN(ano)){toast('Ano inválido','error');return;}
+                lst=lancamentos.filter(l=>l.dataEvento&&new Date(l.dataEvento+'T00:00:00').getMonth()===mes&&new Date(l.dataEvento+'T00:00:00').getFullYear()===ano);
+            } else {
+                const mi=parseInt(document.getElementById('dreMesInicio').value)-1,ai=parseInt(document.getElementById('dreAnoInicio').value);
+                const mf=parseInt(document.getElementById('dreMesFim').value)-1,af=parseInt(document.getElementById('dreAnoFim').value);
+                if(!ai||!af){toast('Anos inválidos','error');return;}
+                lst=lancamentos.filter(l=>{if(!l.dataEvento)return false;const d=new Date(l.dataEvento+'T00:00:00'),ano=d.getFullYear(),mes=d.getMonth();if(ano<ai||(ano===ai&&mes<mi))return false;if(ano>af||(ano===af&&mes>mf))return false;return true;});
+            }
+            const receita=lst.filter(l=>l.tipo==='entrada'&&l.categoria==='receita').reduce((a,b)=>a+b.valor,0);
+            const gastoFixo=lst.filter(l=>l.tipo==='saida'&&l.categoria==='gasto fixo').reduce((a,b)=>a+b.valor,0);
+            const gastoVariavel=lst.filter(l=>l.tipo==='saida'&&l.categoria==='gasto variável').reduce((a,b)=>a+b.valor,0);
+            const lazer=lst.filter(l=>l.tipo==='saida'&&l.categoria==='lazer').reduce((a,b)=>a+b.valor,0);
+            const investimento=lst.filter(l=>l.tipo==='saida'&&l.categoria==='investimento').reduce((a,b)=>a+b.valor,0);
+            const lucro=receita-(gastoFixo+gastoVariavel+lazer+investimento);
+            let html=`<tr class="dre-section"><td colspan="2">RECEITA</td></tr><tr><td style="padding-left:20px;">Total de Entradas</td><td class="dre-valor" style="color:var(--accent)">${fmt(receita)}</td></tr>`;
+            html+=`<tr class="dre-section"><td colspan="2">NECESSIDADES (meta: 50%)</td></tr><tr><td style="padding-left:20px;">Gasto Fixo</td><td class="dre-valor">${fmt(gastoFixo)}</td></tr><tr><td style="padding-left:20px;">Gasto Variável</td><td class="dre-valor">${fmt(gastoVariavel)}</td></tr><tr class="dre-total"><td style="padding-left:20px;">Total Necessidades</td><td class="dre-valor">${fmt(gastoFixo+gastoVariavel)}</td></tr>`;
+            html+=`<tr class="dre-section"><td colspan="2">LAZER (meta: 30%)</td></tr><tr><td style="padding-left:20px;">Total Lazer</td><td class="dre-valor">${fmt(lazer)}</td></tr>`;
+            html+=`<tr class="dre-section"><td colspan="2">INVESTIMENTO (meta: 20%)</td></tr><tr><td style="padding-left:20px;">Total Investimento</td><td class="dre-valor">${fmt(investimento)}</td></tr>`;
+            html+=`<tr class="dre-total" style="font-size:15px;"><td>RESULTADO DO PERÍODO</td><td class="dre-valor" style="color:${lucro>=0?'var(--accent)':'var(--red)'}">${fmt(lucro)}</td></tr>`;
+            document.getElementById('dreBody').innerHTML=html;
+        };
+
+        // ===== HISTÓRICO DRE =====
+        function renderizarHistorico() {
+            const anosMeses=new Set();
+            lancamentos.forEach(l=>{if(l.dataEvento){const d=new Date(l.dataEvento+'T00:00:00');anosMeses.add(`${d.getFullYear()}-${d.getMonth()}`);}});
+            const lista=Array.from(anosMeses).map(chave=>{
+                const [ano,mes]=chave.split('-').map(Number);
+                const {receita,gastoFixo,gastoVariavel,lazer,investimento}=obterDadosMes(ano,mes);
+                const nec=gastoFixo+gastoVariavel;
+                const lucro=receita-(nec+lazer+investimento);
+                const pctNec=receita?(nec/receita)*100:0,pctLazer=receita?(lazer/receita)*100:0,pctInvest=receita?(investimento/receita)*100:0;
+                let status=!receita?'sem-dados':(pctNec<=50&&pctLazer<=30&&pctInvest>=20?'ok':'atencao');
+                return {ano,mes,receita,gastoFixo,gastoVariavel,lazer,investimento,lucro,pctNec,pctLazer,pctInvest,status};
+            }).sort((a,b)=>(a.ano-b.ano)||(a.mes-b.mes));
+            const tbody=document.getElementById('historicoBody');
+            if(lista.length===0){tbody.innerHTML='<tr><td colspan="11" class="empty-state">Nenhum dado disponível</td></tr>';return;}
+            function badgeHtml(i) {
+                if(i.status==='sem-dados')return`<span class="badge" style="background:var(--bg);color:var(--text3);border:1px solid var(--border);">— Sem receita</span>`;
+                if(i.status==='ok')return`<span class="badge badge-ok" style="cursor:pointer;" onclick='abrirModalStatus(${JSON.stringify(i)})'>✓ OK</span>`;
+                return`<span class="badge badge-alert" style="cursor:pointer;" onclick='abrirModalStatus(${JSON.stringify(i)})'>⚠ Atenção</span>`;
+            }
+            tbody.innerHTML=lista.map(i=>`<tr><td><strong>${MESES_CURTOS[i.mes]}/${i.ano}</strong></td><td class="tipo-entrada">${fmt(i.receita)}</td><td>${fmt(i.gastoFixo)}</td><td>${fmt(i.gastoVariavel)}</td><td>${fmt(i.lazer)}</td><td>${fmt(i.investimento)}</td><td style="color:${i.lucro>=0?'var(--accent)':'var(--red)'};font-weight:700;">${fmt(i.lucro)}</td><td>${i.pctNec.toFixed(1)}%</td><td>${i.pctLazer.toFixed(1)}%</td><td>${i.pctInvest.toFixed(1)}%</td><td>${badgeHtml(i)}</td></tr>`).join('');
+        }
+
+        window.abrirModalStatus = (i) => {
+            const nomeMes=`${MESES[i.mes]}/${i.ano}`;
+            const isOk=i.status==='ok';
+            function linha(icone,cor,titulo,pct,descricao){return`<div style="display:flex;gap:12px;align-items:flex-start;padding:12px;border-radius:8px;background:var(--bg);margin-bottom:8px;"><div style="font-size:20px;line-height:1;">${icone}</div><div style="flex:1;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><span style="font-size:13px;font-weight:700;color:var(--text);">${titulo}</span><span style="font-size:13px;font-weight:700;color:${cor};">${pct.toFixed(1)}%</span></div><div style="height:6px;background:var(--border);border-radius:999px;overflow:hidden;margin-bottom:6px;"><div style="height:100%;width:${Math.min(pct,100)}%;background:${cor};border-radius:999px;"></div></div><div style="font-size:12px;color:var(--text2);">${descricao}</div></div></div>`;}
+            const necOk=i.pctNec<=50,lazerOk=i.pctLazer<=30,investOk=i.pctInvest>=20;
+            const necFalta=i.receita*0.50-(i.gastoFixo+i.gastoVariavel);
+            const lazerFalta=i.receita*0.30-i.lazer;
+            const investFalta=i.receita*0.20-i.investimento;
+            let corpo='';
+            corpo+=linha(necOk?'✅':'❌',necOk?'var(--accent)':'var(--red)','Necessidades (meta: até 50%)',i.pctNec,necOk?`Dentro do limite. Pode gastar mais ${fmt(necFalta)}.`:`Acima do limite em ${fmt(-necFalta)}. Reduza gastos.`);
+            corpo+=linha(lazerOk?'✅':'❌',lazerOk?'var(--accent)':'var(--amber)','Lazer (meta: até 30%)',i.pctLazer,lazerOk?`Dentro do limite. Pode gastar mais ${fmt(lazerFalta)}.`:`Acima do limite em ${fmt(-lazerFalta)}.`);
+            corpo+=linha(investOk?'✅':'❌',investOk?'var(--accent)':'var(--red)','Investimento (meta: mínimo 20%)',i.pctInvest,investOk?`Meta atingida! Investiu ${fmt(i.investimento)}.`:`Precisa investir mais ${fmt(-investFalta)} para atingir 20%.`);
+            const resumo=isOk?`<div style="background:var(--accent-light);border-radius:8px;padding:12px;margin-bottom:16px;font-size:13px;color:var(--accent-dark);font-weight:600;">🎉 Parabéns! Você seguiu a Regra 50/30/20 em ${nomeMes}.</div>`:`<div style="background:var(--red-light);border-radius:8px;padding:12px;margin-bottom:16px;font-size:13px;color:var(--red);font-weight:600;">⚠️ Metas não cumpridas em ${nomeMes}. Veja o diagnóstico:</div>`;
+            document.getElementById('modalStatusTitulo').innerText=`Diagnóstico — ${nomeMes}`;
+            document.getElementById('modalStatusCorpo').innerHTML=resumo+corpo;
+            document.getElementById('modalStatus').classList.remove('hidden');
+        };
+        window.fecharModalStatus = () => document.getElementById('modalStatus').classList.add('hidden');
+
+        // ===== CATEGORIAS =====
+        function carregarCategorias() {
+            const tipo=document.getElementById('tipo').value;
+            document.getElementById('categoria').innerHTML=(tipo==='entrada'?CATEGORIAS_ENTRADA:CATEGORIAS_SAIDA).map(c=>`<option value="${c}">${c}</option>`).join('');
+            const fc=document.getElementById('filtroCategoria');
+            if(fc) fc.innerHTML='<option value="todas">Todas as categorias</option>'+[...CATEGORIAS_ENTRADA,...CATEGORIAS_SAIDA].map(c=>`<option value="${c}">${c}</option>`).join('');
+            preencherSelectContas('contaLanc');
+        }
+        function carregarCategoriasEdit() {
+            const tipo=document.getElementById('editTipo').value;
+            document.getElementById('editCategoria').innerHTML=(tipo==='entrada'?CATEGORIAS_ENTRADA:CATEGORIAS_SAIDA).map(c=>`<option value="${c}">${c}</option>`).join('');
+        }
+        window.carregarCategoriasEdit=carregarCategoriasEdit;
+
+        // ===== EXPORT CSV =====
+        window.exportarLancamentosCSV = () => {
+            const filtrados=getLancamentosFiltrados();
+            if(filtrados.length===0){toast('Sem dados','error');return;}
+            let csv=`"Descrição","Categoria","Valor","Data","Tipo","Conta"\n`;
+            filtrados.forEach(l=>{const conta=contas.find(c=>c.id===l.contaId);csv+=`"${l.descricao}","${l.categoria}",${l.valor},"${l.dataEvento}","${l.tipo}","${conta?conta.nome:''}"\n`;});
+            const blob=new Blob(['\uFEFF'+csv],{type:'text/csv'});
+            const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`lancamentos_${Date.now()}.csv`;a.click();
+            toast('CSV exportado!');
+        };
+
+        // ===== TEMA =====
+        let saldosVisiveis = localStorage.getItem('saldos_visiveis') !== 'false';
+        // Guarda os valores reais para restaurar depois
+        const valoresOriginais = {};
+
+        function aplicarVisibilidadeSaldos() {
+            // Cards do topo
+            const ids = ['saldoTotal','totalReceitas','totalDespesas','patrimonioTotal','plPessoal'];
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (!saldosVisiveis) {
+                    el.innerText = '***';
+                } else {
+                    if (valoresOriginais[id]) el.innerText = valoresOriginais[id];
+                }
+            });
+            // Saldos dos cards de contas
+            document.querySelectorAll('.saldo-conta').forEach(el => {
+                if (!saldosVisiveis) {
+                    el.innerText = '***';
+                } else {
+                    el.innerText = el.dataset.valor || '***';
+                }
+            });
+            // Parte comprometida
+            document.querySelectorAll('.saldo-comprometida').forEach(el => {
+                if (!saldosVisiveis) {
+                    el.innerText = '***';
+                } else {
+                    el.innerText = el.dataset.valor || '***';
+                }
+            });
+            const iconEl = document.getElementById('iconOlho');
+            const textoEl = document.getElementById('olhoText');
+            if(iconEl) iconEl.className = saldosVisiveis ? 'fa-solid fa-eye' : 'fa-solid fa-eye-slash';
+            if(textoEl) textoEl.innerText = saldosVisiveis ? 'Ocultar' : 'Mostrar';
+        }
+        window.toggleSaldos = () => {
+            saldosVisiveis = !saldosVisiveis;
+            localStorage.setItem('saldos_visiveis', saldosVisiveis);
+            aplicarVisibilidadeSaldos();
+        };
+
+        // ===== PIN & SENHA =====
+        function hashPin(pin){ let h=0;for(let i=0;i<pin.length;i++){h=((h<<5)-h)+pin.charCodeAt(i);h|=0;}return h.toString(); }
+
+        function mostrarPinLogin(){
+            pinBuffer='';
+            document.getElementById('telaApp').style.display='none';
+            document.getElementById('telaPinLogin').style.display='flex';
+            document.getElementById('pinLoginErro').innerText='';
+            atualizarDisplayPin('pinLoginDisplay');
+        }
+
+        window.pinLoginDigito = (d) => {
+            if(pinBuffer.length>=8) return;
+            pinBuffer+=d;
+            atualizarDisplayPin('pinLoginDisplay');
+            if(pinBuffer.length===8) setTimeout(validarPinLogin,200);
+        };
+        window.pinLoginApagar = () => { pinBuffer=pinBuffer.slice(0,-1); atualizarDisplayPin('pinLoginDisplay'); };
+
+        function validarPinLogin(){
+            if(hashPin(pinBuffer)===configApp.senhaHash){
+                document.getElementById('telaPinLogin').style.display='none';
+                document.getElementById('telaApp').style.display='block';
+                pinBuffer='';
+                renderizarTudo();
+                aplicarVisibilidadeSaldos();
+            } else {
+                document.getElementById('pinLoginErro').innerText='PIN incorreto. Tente novamente.';
+                pinBuffer='';
+                atualizarDisplayPin('pinLoginDisplay');
+            }
+        }
+
+        // PIN Patrimônio
+        window.abrirPinPatrimonio = () => {
+            if(patrimonioDesbloqueado){ mudarAbaReal('patrimonio'); return; }
+            if(!configApp.senhaHash){ mudarAbaReal('patrimonio'); return; }
+            pinBuffer='';
+            document.getElementById('pinPatrimonioErro').innerText='';
+            atualizarDisplayPin('pinPatrimonioDisplay');
+            document.getElementById('modalPinPatrimonio').classList.remove('hidden');
+        };
+        window.fecharPinPatrimonio = () => { document.getElementById('modalPinPatrimonio').classList.add('hidden'); pinBuffer=''; };
+        window.pinPatrimonioDigito = (d) => {
+            if(pinBuffer.length>=8) return;
+            pinBuffer+=d;
+            atualizarDisplayPin('pinPatrimonioDisplay');
+            if(pinBuffer.length===8) setTimeout(validarPinPatrimonio,200);
+        };
+        window.pinPatrimonioApagar = () => { pinBuffer=pinBuffer.slice(0,-1); atualizarDisplayPin('pinPatrimonioDisplay'); };
+        function validarPinPatrimonio(){
+            if(hashPin(pinBuffer)===configApp.senhaHash){
+                patrimonioDesbloqueado=true;
+                document.getElementById('modalPinPatrimonio').classList.add('hidden');
+                pinBuffer='';
+                mudarAbaReal('patrimonio');
+            } else {
+                document.getElementById('pinPatrimonioErro').innerText='PIN incorreto.';
+                pinBuffer=''; atualizarDisplayPin('pinPatrimonioDisplay');
+            }
+        }
+
+        function atualizarDisplayPin(elId){
+            const el=document.getElementById(elId); if(!el) return;
+            el.innerHTML=Array(8).fill(0).map((_,i)=>`<div style="width:14px;height:14px;border-radius:50%;border:2px solid var(--accent);background:${i<pinBuffer.length?'var(--accent)':'transparent'};transition:background 0.15s;"></div>`).join('');
+        }
+
+        // ===== CONFIGURAÇÕES =====
+        window.abrirConfiguracoes = () => {
+            document.getElementById('configSenhaAtual').value='';
+            document.getElementById('configSenhaNova').value='';
+            document.getElementById('configSenhaConfirmar').value='';
+            document.getElementById('configSenhaStatus').innerText='';
+            document.getElementById('configPatrimonioLock').checked=configApp.patrimonioLock!==false;
+            renderizarTemasBotoes();
+            document.getElementById('modalConfiguracoes').classList.remove('hidden');
+        };
+        window.fecharConfiguracoes = () => document.getElementById('modalConfiguracoes').classList.add('hidden');
+
+        window.salvarSenha = async () => {
+            const atual=document.getElementById('configSenhaAtual').value;
+            const nova=document.getElementById('configSenhaNova').value;
+            const confirmar=document.getElementById('configSenhaConfirmar').value;
+            const status=document.getElementById('configSenhaStatus');
+            // Validações
+            if(configApp.senhaHash && hashPin(atual)!==configApp.senhaHash){
+                status.style.color='var(--red)'; status.innerText='PIN atual incorreto.'; return;
+            }
+            if(nova.length!==8||!/^\d+$/.test(nova)){
+                status.style.color='var(--red)'; status.innerText='O novo PIN deve ter exatamente 8 dígitos numéricos.'; return;
+            }
+            if(nova!==confirmar){
+                status.style.color='var(--red)'; status.innerText='Os PINs não coincidem.'; return;
+            }
+            const patrimonioLock=document.getElementById('configPatrimonioLock').checked;
+            configApp={senhaHash:hashPin(nova),patrimonioLock};
+            try {
+                await setDoc(docRef('config','app'),configApp);
+                status.style.color='var(--accent)'; status.innerText='PIN salvo com sucesso!';
+                toast('PIN atualizado!');
+            } catch(e){ status.style.color='var(--red)'; status.innerText='Erro ao salvar.'; }
+        };
+
+        window.removerSenha = async () => {
+            const atual=document.getElementById('configSenhaAtual').value;
+            if(!atual||hashPin(atual)!==configApp.senhaHash){ document.getElementById('configSenhaStatus').style.color='var(--red)'; document.getElementById('configSenhaStatus').innerText='PIN atual incorreto.'; return; }
+            if(!confirm('Remover proteção por PIN?')) return;
+            configApp={senhaHash:'',patrimonioLock:false};
+            await setDoc(docRef('config','app'),configApp);
+            toast('PIN removido!'); fecharConfiguracoes();
+        };
+
+        // ===== OCULTAR SALDOS PATRIMÔNIO =====
+        function aplicarOcultarPatrimonio(){
+            document.querySelectorAll('.saldo-conta').forEach(el=>{
+                el.innerText = saldosVisiveis ? (el.dataset.valor||'***') : '***';
+            });
+        }
+
+        // ===== TEMAS DE COR =====
+        const TEMAS = [
+            {id:'green', nome:'Verde', cor:'#059669'},
+            {id:'blue', nome:'Azul', cor:'#2563eb'},
+            {id:'purple', nome:'Roxo', cor:'#7c3aed'},
+            {id:'rose', nome:'Rosa', cor:'#e11d48'},
+            {id:'orange', nome:'Laranja', cor:'#ea580c'},
+            {id:'teal', nome:'Turquesa', cor:'#0d9488'},
+        ];
+
+        function aplicarTema(temaId){
+            document.documentElement.setAttribute('data-color', temaId==='green'?'':temaId);
+            localStorage.setItem('moneymap_cor', temaId);
+            // Atualizar bolinhas selecionadas
+            document.querySelectorAll('.tema-bolinha').forEach(b=>{
+                b.style.outline = b.dataset.tema===temaId ? '3px solid var(--text)' : 'none';
+                b.style.outlineOffset = '2px';
+            });
+        }
+
+        window.selecionarTema = (temaId) => { aplicarTema(temaId); };
+
+        function renderizarTemasBotoes(){
+            const el=document.getElementById('temasContainer'); if(!el) return;
+            el.innerHTML=TEMAS.map(t=>`
+                <button class="tema-bolinha" data-tema="${t.id}" onclick="selecionarTema('${t.id}')"
+                    title="${t.nome}"
+                    style="width:32px;height:32px;border-radius:50%;background:${t.cor};border:none;cursor:pointer;outline:${(localStorage.getItem('moneymap_cor')||'green')===t.id?'3px solid var(--text)':'none'};outline-offset:2px;transition:all 0.15s;">
+                </button>`).join('');
+        }
+
+        window.toggleTheme = () => {
+            const isDark=document.documentElement.getAttribute('data-theme')==='dark';
+            document.documentElement.setAttribute('data-theme',isDark?'':'dark');
+            localStorage.setItem('tema_financas',isDark?'light':'dark');
+            document.getElementById('themeText').innerText=isDark?'Modo escuro':'Modo claro';
+            atualizarGraficos();
+        };
+
+        // ===== ABAS =====
+        window.mudarAba = (aba) => {
+            // Patrimônio precisa de PIN se configurado e não desbloqueado
+            if(aba==='patrimonio' && configApp.senhaHash && configApp.patrimonioLock && !patrimonioDesbloqueado){
+                abrirPinPatrimonio(); return;
+            }
+            mudarAbaReal(aba);
+        };
+        function mudarAbaReal(aba){
+            document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(btn=>btn.classList.remove('active'));
+            document.getElementById(`tab-${aba}`).classList.add('active');
+            document.querySelector(`.tab-btn[data-tab="${aba}"]`).classList.add('active');
+            if(aba==='dashboard'){atualizarGraficos();atualizarComparativo();atualizarAlertaRegra();}
+            if(aba==='dre'){atualizarDRE();renderizarHistorico();}
+            if(aba==='planejamento'){atualizarProjecao();renderizarRecorrentes();}
+            if(aba==='patrimonio'){renderizarContas();renderizarDividas();calcularScore();}
+        };
+        window.toggleFiltroDRE = () => {
+            const tipo=document.getElementById('dreTipoPeriodo').value;
+            document.getElementById('dreFiltroMes').style.display=tipo==='mes'?'flex':'none';
+            document.getElementById('dreFiltroIntervalo').style.display=tipo==='intervalo'?'flex':'none';
+        };
+
+        function renderizarTudo() {
+            atualizarSaldo();
+            renderizarTabela();
+            atualizarGraficos();
+            atualizarComparativo();
+            atualizarAlertaRegra();
+            carregarCategorias();
+            renderizarHistorico();
+            renderizarContas();
+            renderizarDividas();
+            renderizarRecorrentes();
+            atualizarProjecao();
+            calcularScore();
+            // Metas UI
+            document.getElementById('metaReserva').value=metas.reserva||'';
+            const cont=document.getElementById('objetivosContainer');
+            if(cont){cont.innerHTML='';(metas.objetivos||[]).forEach(o=>{const div=document.createElement('div');div.className='objetivo-item';div.style.cssText='display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:8px;align-items:end;margin-bottom:8px;';div.innerHTML=`<input class="obj-nome" value="${escapeHtml(o.nome)}" placeholder="Ex: Viagem..." style="height:36px;"><input class="obj-valor" type="number" value="${o.valor}" placeholder="Valor R$" style="height:36px;"><input class="obj-prazo" type="number" value="${o.prazo}" placeholder="Meses" style="height:36px;"><button onclick="this.parentElement.remove()" style="height:36px;width:36px;border:1px solid var(--red);background:var(--red-light);color:var(--red);border-radius:var(--radius-sm);cursor:pointer;"><i class="fa-solid fa-trash"></i></button>`;cont.appendChild(div);});}
+            const anos=[...new Set(lancamentos.map(l=>new Date(l.dataEvento+'T00:00:00').getFullYear()).filter(y=>y))];
+            const sa=document.getElementById('filtroAno');
+            if(sa) sa.innerHTML='<option value="todos">Todos os anos</option>'+anos.map(a=>`<option value="${a}">${a}</option>`).join('');
+            verificarAlertas();
+        }
+
+        // Init
+        (function initTheme(){
+            const t=localStorage.getItem('tema_financas');
+            if(t==='dark') document.documentElement.setAttribute('data-theme','dark');
+            const el=document.getElementById('themeText');
+            if(el) el.innerText=t==='dark'?'Modo claro':'Modo escuro';
+            // Aplicar cor salva
+            const cor=localStorage.getItem('moneymap_cor')||'green';
+            document.documentElement.setAttribute('data-color', cor==='green'?'':cor);
+        })();
+        document.getElementById('tipo')?.addEventListener('change',carregarCategorias);
+        document.getElementById('editTipo')?.addEventListener('change',carregarCategoriasEdit);
+        document.getElementById('dreTipoPeriodo')?.addEventListener('change',window.toggleFiltroDRE);
+        window.toggleFiltroDRE();
+        const dtInput=document.getElementById('dataEvento');
+        if(dtInput&&!dtInput.value)dtInput.value=new Date().toISOString().slice(0,10);
+        const dreAnoEl=document.getElementById('dreAno');if(dreAnoEl)dreAnoEl.value=new Date().getFullYear();
+        const dreAnoIEl=document.getElementById('dreAnoInicio');if(dreAnoIEl)dreAnoIEl.value=new Date().getFullYear();
+        const dreAnoFEl=document.getElementById('dreAnoFim');if(dreAnoFEl)dreAnoFEl.value=new Date().getFullYear();
+        const dreMesEl=document.getElementById('dreMes');if(dreMesEl)dreMesEl.value=new Date().getMonth()+1;
+    </script>
+
+    <style>
+        :root{--bg:#f0f4f8;--surface:#ffffff;--border:#e2e8f0;--border-strong:#cbd5e1;--text:#1a202c;--text2:#64748b;--text3:#94a3b8;--accent:#059669;--accent-dark:#047857;--accent-light:#d1fae5;--red:#dc2626;--red-light:#fee2e2;--amber:#d97706;--amber-light:#fef3c7;--blue:#2563eb;--shadow-sm:0 1px 3px rgba(0,0,0,0.06);--radius:12px;--radius-sm:8px;--radius-full:999px;}
+        [data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--border-strong:#475569;--text:#f1f5f9;--text2:#94a3b8;--text3:#64748b;--accent:#10b981;--accent-dark:#059669;--accent-light:rgba(16,185,129,0.15);--red:#f87171;--red-light:rgba(220,38,38,0.15);--amber:#fbbf24;--amber-light:rgba(217,119,6,0.15);}
+        /* TEMAS DE COR */
+        [data-color="blue"]{--accent:#2563eb;--accent-dark:#1d4ed8;--accent-light:#dbeafe;}
+        [data-color="blue"][data-theme="dark"]{--accent:#60a5fa;--accent-dark:#3b82f6;--accent-light:rgba(96,165,250,0.15);}
+        [data-color="purple"]{--accent:#7c3aed;--accent-dark:#6d28d9;--accent-light:#ede9fe;}
+        [data-color="purple"][data-theme="dark"]{--accent:#a78bfa;--accent-dark:#8b5cf6;--accent-light:rgba(167,139,250,0.15);}
+        [data-color="rose"]{--accent:#e11d48;--accent-dark:#be123c;--accent-light:#ffe4e6;}
+        [data-color="rose"][data-theme="dark"]{--accent:#fb7185;--accent-dark:#f43f5e;--accent-light:rgba(251,113,133,0.15);}
+        [data-color="orange"]{--accent:#ea580c;--accent-dark:#c2410c;--accent-light:#ffedd5;}
+        [data-color="orange"][data-theme="dark"]{--accent:#fb923c;--accent-dark:#f97316;--accent-light:rgba(251,146,60,0.15);}
+        [data-color="teal"]{--accent:#0d9488;--accent-dark:#0f766e;--accent-light:#ccfbf1;}
+        [data-color="teal"][data-theme="dark"]{--accent:#2dd4bf;--accent-dark:#14b8a6;--accent-light:rgba(45,212,191,0.15);}
+        *{box-sizing:border-box;margin:0;padding:0;}
+        body{font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);transition:background 0.3s,color 0.3s;min-height:100vh;}
+        #loadingBar{display:none;position:fixed;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-dark));z-index:9999;animation:loading 1.5s infinite;}
+        @keyframes loading{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+        #telaLogin{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:24px;background:var(--bg);}
+        .login-card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:48px 40px;text-align:center;max-width:400px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,0.08);}
+        .login-logo{width:64px;height:64px;border-radius:16px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:white;font-size:28px;margin:0 auto 20px;}
+        .login-title{font-size:22px;font-weight:700;margin-bottom:8px;}
+        .login-sub{font-size:14px;color:var(--text2);margin-bottom:32px;line-height:1.5;}
+        #btnLogin{display:flex;align-items:center;gap:10px;justify-content:center;width:100%;padding:13px 20px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:15px;font-weight:600;cursor:pointer;transition:all 0.15s;}
+        #btnLogin:hover{border-color:var(--border-strong);background:var(--bg);}
+        #btnLogin:disabled{opacity:0.6;cursor:not-allowed;}
+        .login-footer{margin-top:24px;font-size:12px;color:var(--text3);}
+        #telaApp{display:none;padding:20px 16px 40px;}
+        .container{max-width:1300px;margin:0 auto;}
+        header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px;}
+        .logo{display:flex;align-items:center;gap:12px;}
+        .logo-icon{width:40px;height:40px;border-radius:var(--radius-sm);background:var(--accent);display:flex;align-items:center;justify-content:center;color:white;font-size:18px;}
+        h1{font-size:22px;font-weight:700;letter-spacing:-0.3px;}
+        .header-actions{display:flex;gap:8px;align-items:center;}
+        .pill-btn{background:var(--surface);border:1px solid var(--border);padding:7px 16px;border-radius:var(--radius-full);cursor:pointer;font-size:13px;color:var(--text2);display:flex;align-items:center;gap:7px;transition:all 0.15s;font-weight:500;}
+        .pill-btn:hover{border-color:var(--border-strong);color:var(--text);}
+        .user-badge{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-full);padding:5px 14px 5px 6px;cursor:pointer;transition:all 0.15s;}
+        .user-badge:hover{border-color:var(--border-strong);}
+        .user-avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;}
+        .user-name{font-size:13px;font-weight:600;color:var(--text);}
+        .user-email-small{font-size:11px;color:var(--text2);}
+        .metrics-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px;}
+        .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow-sm);}
+        .metric-card.main{background:var(--accent);border-color:var(--accent-dark);}
+        .metric-label{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;}
+        .metric-card.main .metric-label{color:rgba(255,255,255,0.75);}
+        .metric-value{font-size:24px;font-weight:700;letter-spacing:-0.5px;}
+        .metric-card.main .metric-value{color:white;}
+        .metric-value.income{color:var(--accent);}
+        .metric-value.expense{color:var(--red);}
+        .metric-sub{font-size:12px;color:rgba(255,255,255,0.65);margin-top:6px;}
+        .tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:22px;overflow-x:auto;}
+        .tab-btn{background:none;border:none;padding:11px 18px;font-size:13px;font-weight:600;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;display:flex;align-items:center;gap:7px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;transition:all 0.15s;}
+        .tab-btn:hover{background:var(--bg);color:var(--text);}
+        .tab-btn.active{color:var(--accent);border-bottom-color:var(--accent);}
+        .tab-content{display:none;}
+        .tab-content.active{display:block;}
+        .card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-sm);}
+        .card-title{font-size:14px;font-weight:600;color:var(--text2);margin-bottom:16px;text-transform:uppercase;letter-spacing:0.04em;}
+        .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+        .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;}
+        .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:16px;}
+        .form-card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-sm);}
+        .form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr auto;gap:10px;align-items:end;}
+        .form-group{display:flex;flex-direction:column;gap:5px;}
+        .form-group label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--text3);}
+        input,select{padding:9px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);font-size:13px;outline:none;transition:border-color 0.15s;height:38px;}
+        input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-light);}
+        .btn{padding:9px 18px;border-radius:var(--radius-sm);border:none;cursor:pointer;font-weight:700;display:inline-flex;align-items:center;gap:7px;transition:all 0.15s;font-size:13px;height:38px;}
+        .btn-primary{background:var(--accent);color:white;}
+        .btn-primary:hover{background:var(--accent-dark);}
+        .btn-primary:disabled{opacity:0.6;cursor:not-allowed;}
+        .btn-outline{background:var(--surface);border:1px solid var(--border);color:var(--text2);}
+        .btn-outline:hover{border-color:var(--border-strong);color:var(--text);}
+        .btn-danger{background:var(--red-light);border:1px solid var(--red);color:var(--red);}
+        .btn-add{justify-content:center;}
+        .filtros{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;}
+        .filtro-chip{padding:6px 14px;border-radius:var(--radius-full);background:var(--surface);border:1px solid var(--border);cursor:pointer;font-size:12px;font-weight:600;color:var(--text2);transition:all 0.15s;}
+        .filtro-chip.active{background:var(--accent);color:white;border-color:var(--accent);}
+        .table-wrap{overflow-x:auto;border-radius:var(--radius);border:1px solid var(--border);}
+        table{width:100%;border-collapse:collapse;}
+        th{padding:11px 16px;text-align:left;background:var(--bg);border-bottom:1px solid var(--border);color:var(--text3);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;}
+        td{padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;}
+        tr:last-child td{border-bottom:none;}
+        tr:hover td{background:var(--bg);}
+        .tipo-entrada{color:var(--accent);font-weight:700;}
+        .tipo-saida{color:var(--red);font-weight:700;}
+        .cat-pill{display:inline-block;padding:2px 9px;border-radius:var(--radius-full);font-size:11px;font-weight:600;background:var(--bg);color:var(--text2);border:1px solid var(--border);}
+        .acoes{display:flex;gap:4px;}
+        .acoes button{background:var(--surface);border:1px solid var(--border);cursor:pointer;width:30px;height:30px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;color:var(--text2);font-size:12px;transition:all 0.15s;}
+        .acoes button:hover{border-color:var(--border-strong);color:var(--text);}
+        .acoes button.del:hover{border-color:var(--red);color:var(--red);background:var(--red-light);}
+        .empty-state{text-align:center;padding:48px;color:var(--text3);font-size:14px;}
+        canvas{max-height:280px;width:100%!important;}
+        .rule-row{margin-bottom:14px;}
+        .rule-header{display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;}
+        .rule-name{color:var(--text2);font-weight:500;}
+        .rule-meta{font-size:11px;color:var(--text3);}
+        .rule-pct{font-weight:700;}
+        .progress-track{height:8px;background:var(--bg);border-radius:var(--radius-full);overflow:hidden;border:1px solid var(--border);}
+        .progress-fill{height:100%;border-radius:var(--radius-full);transition:width 0.5s ease;}
+        .badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:var(--radius-full);font-size:10px;font-weight:700;margin-left:6px;}
+        .badge-ok{background:var(--accent-light);color:var(--accent-dark);}
+        .badge-alert{background:var(--amber-light);color:var(--amber);}
+        .dre-table{width:100%;border-collapse:collapse;}
+        .dre-table th,.dre-table td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:13px;}
+        .dre-table th{background:var(--bg);font-weight:700;font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:0.04em;}
+        .dre-total{font-weight:700;background:var(--bg);}
+        .dre-section td{font-weight:700;color:var(--text);padding-top:14px;}
+        .dre-valor{text-align:right;font-family:'Courier New',monospace;font-size:13px;font-weight:600;}
+        .filtro-periodo{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+        .comp-table{width:100%;border-collapse:collapse;}
+        .comp-table th,.comp-table td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:13px;}
+        .comp-table th{background:var(--bg);font-weight:700;font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.04em;}
+        .var-pos{color:var(--accent);font-weight:600;}
+        .var-neg{color:var(--red);font-weight:600;}
+        /* SCORE */
+        .score-arc{width:120px;height:120px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;}
+        .score-inner{width:88px;height:88px;border-radius:50%;background:var(--surface);display:flex;flex-direction:column;align-items:center;justify-content:center;}
+        .toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--border);border-left:4px solid;padding:12px 20px;border-radius:var(--radius);z-index:9000;animation:slideIn 0.25s ease;box-shadow:0 4px 16px rgba(0,0,0,0.1);font-size:14px;font-weight:500;display:flex;align-items:center;gap:10px;max-width:360px;}
+        @keyframes slideIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}
+        .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000;backdrop-filter:blur(2px);}
+        .modal-overlay.hidden{display:none;}
+        .modal{background:var(--surface);border-radius:var(--radius);padding:28px;width:92%;max-width:480px;box-shadow:0 8px 32px rgba(0,0,0,0.15);border:1px solid var(--border);max-height:90vh;overflow-y:auto;}
+        .modal h3{font-size:18px;font-weight:700;margin-bottom:20px;}
+        .modal .form-group{margin-bottom:12px;}
+        .modal input,.modal select{width:100%;}
+        .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px;}
+        .pin-key{padding:14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface);font-size:18px;font-weight:700;cursor:pointer;color:var(--text);transition:all 0.1s;}
+        .pin-key:hover{background:var(--accent);color:white;border-color:var(--accent);}
+        @media(max-width:1000px){.metrics-row{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}.grid-3{grid-template-columns:1fr}}
+        @media(max-width:700px){.metrics-row{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr 1fr}.form-grid .btn-add{grid-column:span 2}h1{font-size:18px}.user-email-small{display:none}}
+        @media(max-width:500px){.form-grid{grid-template-columns:1fr}.form-grid .btn-add{grid-column:1}}
+    </style>
+</head>
+<body>
+<div id="loadingBar"></div>
+
+<!-- TELA PIN LOGIN -->
+<div id="telaPinLogin" style="display:none;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:24px;background:var(--bg);">
+    <div class="login-card">
+        <div class="login-logo"><i class="fa-solid fa-lock"></i></div>
+        <div class="login-title">Verificação de Identidade</div>
+        <div class="login-sub">Digite seu PIN de 8 dígitos para continuar</div>
+        <div id="pinLoginDisplay" style="display:flex;gap:10px;justify-content:center;margin:20px 0;"></div>
+        <div id="pinLoginErro" style="color:var(--red);font-size:13px;margin-bottom:12px;min-height:20px;"></div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:220px;margin:0 auto;">
+            <button onclick="pinLoginDigito(1)" class="pin-key">1</button>
+            <button onclick="pinLoginDigito(2)" class="pin-key">2</button>
+            <button onclick="pinLoginDigito(3)" class="pin-key">3</button>
+            <button onclick="pinLoginDigito(4)" class="pin-key">4</button>
+            <button onclick="pinLoginDigito(5)" class="pin-key">5</button>
+            <button onclick="pinLoginDigito(6)" class="pin-key">6</button>
+            <button onclick="pinLoginDigito(7)" class="pin-key">7</button>
+            <button onclick="pinLoginDigito(8)" class="pin-key">8</button>
+            <button onclick="pinLoginDigito(9)" class="pin-key">9</button>
+            <div></div>
+            <button onclick="pinLoginDigito(0)" class="pin-key">0</button>
+            <button onclick="pinLoginApagar()" class="pin-key" style="font-size:16px;">⌫</button>
+        </div>
+        <div style="margin-top:16px;"><button class="pill-btn" onclick="fazerLogout()" style="margin:0 auto;"><i class="fa-solid fa-right-from-bracket"></i> Sair da conta</button></div>
+    </div>
+</div>
+
+<!-- TELA LOGIN -->
+<div id="telaLogin">
+    <div class="login-card">
+        <div class="login-logo"><i class="fa-solid fa-chart-line"></i></div>
+        <div class="login-title">MoneyMap</div>
+        <div class="login-sub">Seu mapa financeiro pessoal.<br>Controle, planeje e conquiste seus objetivos.</div>
+        <button id="btnLogin" onclick="fazerLogin()">
+            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20"> Entrar com Google
+        </button>
+        <div class="login-footer">Seus dados ficam vinculados à sua conta Google.<br>Nenhum outro usuário tem acesso às suas informações.</div>
+    </div>
+</div>
+
+<!-- TELA APP -->
+<div id="telaApp">
+<div class="container">
+    <header>
+        <div class="logo">
+            <div class="logo-icon"><i class="fa-solid fa-chart-line"></i></div>
+            <h1>MoneyMap</h1>
+        </div>
+        <div class="header-actions">
+            <button class="pill-btn" onclick="toggleSaldos()" title="Ocultar/mostrar saldos"><i class="fa-solid fa-eye" id="iconOlho"></i> <span id="olhoText">Ocultar</span></button>
+            <button class="pill-btn" onclick="toggleTheme()"><i class="fa-solid fa-moon"></i> <span id="themeText">Modo escuro</span></button>
+            <button class="pill-btn" onclick="abrirConfiguracoes()" title="Configurações"><i class="fa-solid fa-gear"></i></button>
+            <div class="user-badge" onclick="fazerLogout()" title="Clique para sair">
+                <img id="userAvatar" class="user-avatar" src="" alt="">
+                <div><div class="user-name" id="userName"></div><div class="user-email-small" id="userEmail"></div></div>
+                <i class="fa-solid fa-right-from-bracket" style="color:var(--text3);font-size:12px;margin-left:4px;"></i>
+            </div>
+        </div>
+    </header>
+
+    <!-- MÉTRICAS -->
+    <div class="metrics-row">
+        <div class="metric-card main">
+            <div class="metric-label">Saldo Atual</div>
+            <div class="metric-value saldo-valor" id="saldoTotal">R$ 0,00</div>
+            <div class="metric-sub">Entradas menos saídas</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Total de Entradas</div>
+            <div class="metric-value income saldo-valor" id="totalReceitas">R$ 0,00</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Total de Saídas</div>
+            <div class="metric-value expense saldo-valor" id="totalDespesas">R$ 0,00</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Patrimônio Total</div>
+            <div class="metric-value income saldo-valor" id="patrimonioTotal">R$ 0,00</div>
+        </div>
+    </div>
+
+    <!-- ABAS -->
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="dashboard" onclick="mudarAba('dashboard')"><i class="fa-solid fa-chart-pie"></i> Dashboard</button>
+        <button class="tab-btn" data-tab="lancamentos" onclick="mudarAba('lancamentos')"><i class="fa-solid fa-list"></i> Lançamentos</button>
+        <button class="tab-btn" data-tab="patrimonio" onclick="mudarAba('patrimonio')"><i class="fa-solid fa-building-columns"></i> Patrimônio</button>
+        <button class="tab-btn" data-tab="planejamento" onclick="mudarAba('planejamento')"><i class="fa-solid fa-rocket"></i> Planejamento</button>
+        <button class="tab-btn" data-tab="dre" onclick="mudarAba('dre')"><i class="fa-solid fa-chart-simple"></i> DRE</button>
+        <button class="tab-btn" data-tab="manual" onclick="mudarAba('manual')"><i class="fa-solid fa-book-open"></i> Manual</button>
+    </div>
+
+    <!-- DASHBOARD -->
+    <div id="tab-dashboard" class="tab-content active">
+        <div class="grid-2">
+            <div class="card"><div class="card-title">Evolução Mensal — Entradas x Saídas</div><canvas id="chartMensal"></canvas></div>
+            <div class="card"><div class="card-title">Evolução do Patrimônio</div><canvas id="chartPatrimonio"></canvas></div>
+            <div class="card"><div class="card-title">Distribuição das Saídas por Categoria</div><canvas id="chartCategorias"></canvas></div>
+            <div class="card"><div class="card-title">Regra 50/30/20 — Mês Atual</div><div id="alertaRegra"></div></div>
+        </div>
+        <div class="card"><div class="card-title">Comparativo Mensal</div><div style="overflow-x:auto;" id="comparativoMensal"></div></div>
+    </div>
+
+    <!-- LANÇAMENTOS -->
+    <div id="tab-lancamentos" class="tab-content">
+        <div class="form-card">
+            <div class="card-title" style="margin-bottom:14px;">Novo Lançamento</div>
+            <div class="form-grid">
+                <div class="form-group"><label>Descrição</label><input type="text" id="descricao" placeholder="Ex: Honorários, Mercado..."></div>
+                <div class="form-group"><label>Valor (R$)</label><input type="number" id="valor" step="0.01" placeholder="0,00"></div>
+                <div class="form-group"><label>Tipo</label><select id="tipo"><option value="entrada">Entrada</option><option value="saida">Saída</option></select></div>
+                <div class="form-group"><label>Categoria</label><select id="categoria"></select></div>
+                <div class="form-group"><label>Conta</label><select id="contaLanc"></select></div>
+                <div class="form-group"><label>Data</label><input type="date" id="dataEvento"></div>
+                <button class="btn btn-primary btn-add" onclick="adicionarLancamento()"><i class="fa-solid fa-plus"></i> Adicionar</button>
+            </div>
+        </div>
+        <div class="filtros">
+            <button class="filtro-chip active" data-filtro="todos" onclick="filtrarLancamentos('todos')">Todos</button>
+            <button class="filtro-chip" data-filtro="entrada" onclick="filtrarLancamentos('entrada')">Entradas</button>
+            <button class="filtro-chip" data-filtro="saida" onclick="filtrarLancamentos('saida')">Saídas</button>
+            <select id="filtroCategoria" onchange="renderizarTabela()" style="height:34px;font-size:12px;"><option value="todas">Todas as categorias</option></select>
+            <select id="filtroAno" onchange="renderizarTabela()" style="height:34px;font-size:12px;"></select>
+            <div style="margin-left:auto;"><button class="btn btn-outline" onclick="exportarLancamentosCSV()"><i class="fa-solid fa-download"></i> Exportar CSV</button></div>
+        </div>
+        <div class="table-wrap">
+            <table><thead><tr><th>Descrição</th><th>Categoria</th><th>Valor</th><th>Data</th><th>Conta</th><th>Ações</th></tr></thead><tbody id="corpoTabela"></tbody></table>
+        </div>
+    </div>
+
+    <!-- PATRIMÔNIO -->
+    <div id="tab-patrimonio" class="tab-content">
+        <!-- SCORE -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title" style="margin-bottom:0;">Score de Saúde Financeira</div>
+            </div>
+            <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;">
+                <div style="text-align:center;min-width:140px;">
+                    <div class="score-arc" id="scoreArc" style="background:conic-gradient(var(--accent) 0deg, var(--border) 0deg);">
+                        <div class="score-inner">
+                            <div id="scoreValor" style="font-size:28px;font-weight:700;">0</div>
+                            <div id="scoreLabel" style="font-size:11px;color:var(--text2);font-weight:600;"></div>
+                        </div>
+                    </div>
+                    <div style="font-size:11px;color:var(--text3);">de 100 pontos</div>
+                </div>
+                <div style="flex:1;min-width:200px;" id="scoreCriterios"></div>
+            </div>
+        </div>
+        <!-- CONTAS -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title" style="margin-bottom:0;">Minhas Contas</div>
+                <button class="btn btn-primary" onclick="abrirModalConta()"><i class="fa-solid fa-plus"></i> Nova Conta</button>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;" id="contasGrid"></div>
+        </div>
+        <!-- DÍVIDAS -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title" style="margin-bottom:0;">Controle de Dívidas</div>
+                <button class="btn btn-primary" onclick="abrirModalDivida()"><i class="fa-solid fa-plus"></i> Nova Dívida</button>
+            </div>
+            <div id="dividasLista"></div>
+        </div>
+    </div>
+
+    <!-- PLANEJAMENTO -->
+    <div id="tab-planejamento" class="tab-content">
+        <!-- PROJEÇÃO -->
+        <div class="card">
+            <div class="card-title">Projeção de Saldo — Próximos 6 Meses</div>
+            <div id="projecaoContainer"></div>
+        </div>
+        <!-- OBJETIVOS -->
+        <div class="card">
+            <div class="card-title">Objetivos Financeiros</div>
+            <div id="objetivosProjecao"></div>
+        </div>
+        <!-- RECORRENTES -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title" style="margin-bottom:0;">Lançamentos Recorrentes</div>
+                <button class="btn btn-primary" onclick="abrirModalRecorrente()"><i class="fa-solid fa-plus"></i> Novo</button>
+            </div>
+            <div id="recorrentesList"></div>
+        </div>
+        <!-- METAS -->
+        <div class="card">
+            <div class="card-title">Metas e Objetivos</div>
+            <div class="form-group" style="margin-bottom:16px;">
+                <label>Meta de Reserva de Emergência (R$)</label>
+                <input type="number" id="metaReserva" placeholder="Ex: 20000 (equivale a 6 meses de gastos)">
+            </div>
+            <div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:12px;">Objetivos</div>
+            <div id="objetivosContainer"></div>
+            <button class="btn btn-outline" onclick="adicionarObjetivoItem()" style="margin-bottom:16px;"><i class="fa-solid fa-plus"></i> Adicionar Objetivo</button>
+            <div><button class="btn btn-primary" onclick="salvarMetas()"><i class="fa-solid fa-floppy-disk"></i> Salvar Metas</button></div>
+        </div>
+    </div>
+
+    <!-- DRE -->
+    <div id="tab-dre" class="tab-content">
+        <div class="card">
+            <div class="card-title">Demonstração do Resultado do Exercício</div>
+            <div class="filtro-periodo" style="margin-bottom:18px;">
+                <select id="dreTipoPeriodo" style="height:36px;" onchange="toggleFiltroDRE()"><option value="mes">Mês específico</option><option value="intervalo">Intervalo de meses</option></select>
+                <div id="dreFiltroMes" style="display:flex;gap:8px;">
+                    <select id="dreMes" style="height:36px;"><option value="1">Janeiro</option><option value="2">Fevereiro</option><option value="3">Março</option><option value="4">Abril</option><option value="5">Maio</option><option value="6">Junho</option><option value="7">Julho</option><option value="8">Agosto</option><option value="9">Setembro</option><option value="10">Outubro</option><option value="11">Novembro</option><option value="12">Dezembro</option></select>
+                    <input type="number" id="dreAno" placeholder="Ano" style="width:90px;height:36px;">
+                </div>
+                <div id="dreFiltroIntervalo" style="display:none;gap:8px;flex-wrap:wrap;align-items:center;">
+                    <select id="dreMesInicio" style="height:36px;"><option value="1">Jan</option><option value="2">Fev</option><option value="3">Mar</option><option value="4">Abr</option><option value="5">Mai</option><option value="6">Jun</option><option value="7">Jul</option><option value="8">Ago</option><option value="9">Set</option><option value="10">Out</option><option value="11">Nov</option><option value="12">Dez</option></select>
+                    <input type="number" id="dreAnoInicio" placeholder="Ano" style="width:90px;height:36px;">
+                    <span style="color:var(--text2);font-size:13px;">até</span>
+                    <select id="dreMesFim" style="height:36px;"><option value="1">Jan</option><option value="2">Fev</option><option value="3">Mar</option><option value="4">Abr</option><option value="5">Mai</option><option value="6">Jun</option><option value="7">Jul</option><option value="8">Ago</option><option value="9">Set</option><option value="10">Out</option><option value="11">Nov</option><option value="12">Dez</option></select>
+                    <input type="number" id="dreAnoFim" placeholder="Ano" style="width:90px;height:36px;">
+                </div>
+                <button class="btn btn-primary" onclick="atualizarDRE()"><i class="fa-solid fa-rotate"></i> Atualizar</button>
+            </div>
+            <div style="overflow-x:auto;"><table class="dre-table"><thead><tr><th colspan="2">DRE — Demonstração do Resultado</th></tr><tr><th>Descrição</th><th style="text-align:right;">Valor (R$)</th></tr></thead><tbody id="dreBody"><tr><td colspan="2" class="empty-state">Selecione um período e clique em "Atualizar"</td></tr></tbody></table></div>
+        </div>
+        <div class="card">
+            <div class="card-title">Histórico de Competências</div>
+            <div style="overflow-x:auto;"><table class="dre-table"><thead><tr><th>Mês/Ano</th><th>Receita</th><th>Gasto Fixo</th><th>Gasto Variável</th><th>Lazer</th><th>Investimento</th><th>Resultado</th><th>% Nec.</th><th>% Lazer</th><th>% Invest.</th><th>Status</th></tr></thead><tbody id="historicoBody"></tbody></table></div>
+        </div>
+    </div>
+</div>
+
+    <!-- MANUAL -->
+    <div id="tab-manual" class="tab-content">
+        <div class="card">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;">
+                <div style="width:48px;height:48px;border-radius:var(--radius-sm);background:var(--accent);display:flex;align-items:center;justify-content:center;color:white;font-size:22px;flex-shrink:0;"><i class="fa-solid fa-book-open"></i></div>
+                <div><div style="font-size:20px;font-weight:700;">Manual do MoneyMap</div><div style="font-size:13px;color:var(--text2);">Guia completo para usar o sistema</div></div>
+            </div>
+
+            <!-- ÍNDICE -->
+            <div style="background:var(--bg);border-radius:var(--radius-sm);padding:16px;margin-bottom:24px;">
+                <div style="font-size:13px;font-weight:700;color:var(--text2);margin-bottom:10px;">📋 ÍNDICE</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                    <a href="#sec1" style="color:var(--accent);font-size:13px;text-decoration:none;">1. Primeiros Passos</a>
+                    <a href="#sec2" style="color:var(--accent);font-size:13px;text-decoration:none;">2. Lançamentos</a>
+                    <a href="#sec3" style="color:var(--accent);font-size:13px;text-decoration:none;">3. Contas Bancárias</a>
+                    <a href="#sec4" style="color:var(--accent);font-size:13px;text-decoration:none;">4. Regra 50/30/20</a>
+                    <a href="#sec5" style="color:var(--accent);font-size:13px;text-decoration:none;">5. Dívidas</a>
+                    <a href="#sec6" style="color:var(--accent);font-size:13px;text-decoration:none;">6. Planejamento</a>
+                    <a href="#sec7" style="color:var(--accent);font-size:13px;text-decoration:none;">7. Score Financeiro</a>
+                    <a href="#sec8" style="color:var(--accent);font-size:13px;text-decoration:none;">8. DRE</a>
+                    <a href="#sec9" style="color:var(--accent);font-size:13px;text-decoration:none;">9. Segurança e PIN</a>
+                    <a href="#sec10" style="color:var(--accent);font-size:13px;text-decoration:none;">10. Dicas Gerais</a>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 1 -->
+            <div id="sec1" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">1</span> Primeiros Passos</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:8px;">Bem-vindo ao <strong>MoneyMap</strong>! O sistema funciona em qualquer dispositivo com internet — computador, celular ou tablet.</p>
+                    <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;margin:10px 0;">
+                        <strong style="color:var(--accent-dark);">✅ Como começar:</strong><br>
+                        1. Faça login com sua conta Google<br>
+                        2. Se solicitado, digite seu PIN de 8 dígitos<br>
+                        3. Cadastre suas contas bancárias na aba <strong>Patrimônio</strong><br>
+                        4. Comece a lançar suas receitas e despesas na aba <strong>Lançamentos</strong><br>
+                        5. Acompanhe seus resultados no <strong>Dashboard</strong>
+                    </div>
+                    <p>Seus dados ficam salvos automaticamente na nuvem — você nunca perde informação.</p>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 2 -->
+            <div id="sec2" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">2</span> Lançamentos</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">Na aba <strong>Lançamentos</strong> você registra todas as entradas e saídas de dinheiro.</p>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+                        <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;">
+                            <strong style="color:var(--accent-dark);">📥 Tipos de Entrada</strong><br>
+                            • <strong>Receita</strong> — salário, freela, rendimentos
+                        </div>
+                        <div style="background:var(--red-light);border-radius:var(--radius-sm);padding:12px;">
+                            <strong style="color:var(--red);">📤 Tipos de Saída</strong><br>
+                            • <strong>Gasto Fixo</strong> — aluguel, financiamento, mensalidades<br>
+                            • <strong>Gasto Variável</strong> — mercado, farmácia, saúde<br>
+                            • <strong>Lazer</strong> — restaurante, viagem, entretenimento<br>
+                            • <strong>Investimento</strong> — poupança, ações, fundos
+                        </div>
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;">
+                        <strong>💡 Dica importante:</strong> Sempre vincule o lançamento a uma conta bancária. O saldo da conta será atualizado automaticamente!
+                    </div>
+                    <p style="margin-top:10px;">Use os <strong>filtros</strong> no topo da tabela para visualizar por tipo, categoria ou ano. Você também pode <strong>exportar em CSV</strong> para usar no Excel.</p>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 3 -->
+            <div id="sec3" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">3</span> Contas Bancárias</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">Na aba <strong>Patrimônio → Minhas Contas</strong> você cadastra todas as suas contas.</p>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;"><strong>🏦 Conta Corrente</strong><br>Conta principal do dia a dia</div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;"><strong>💰 Poupança</strong><br>Conta de reservas</div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;"><strong>💳 Cartão de Crédito</strong><br>Informe limite, vencimento e fechamento</div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;"><strong>📈 Investimento</strong><br>Corretora, tesouro, fundos</div>
+                    </div>
+                    <div style="background:var(--amber-light);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;">
+                        <strong style="color:var(--amber);">⚠️ Conta Comprometida</strong><br>
+                        Use para contas compartilhadas (ex: conta da casa que você divide com cônjuge). O valor comprometido é sua parte mensal. Essas contas <strong>não entram no seu Patrimônio Líquido pessoal</strong>, mas você ainda pode lançar entradas e saídas nelas normalmente.
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;">
+                        <strong>🔄 Transferência entre contas:</strong> Use o botão "Transferência entre Contas" no topo da aba Patrimônio quando mover dinheiro de uma conta para outra. O sistema atualiza os saldos de ambas automaticamente.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 4 -->
+            <div id="sec4" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">4</span> Regra 50/30/20</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">O sistema avalia automaticamente se você está seguindo a <strong>Regra 50/30/20</strong>, uma das estratégias financeiras mais reconhecidas do mundo.</p>
+                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px;">
+                        <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;text-align:center;"><div style="font-size:22px;font-weight:700;color:var(--accent);">50%</div><strong>Necessidades</strong><br><span style="font-size:11px;">Gasto Fixo + Variável</span></div>
+                        <div style="background:var(--amber-light);border-radius:var(--radius-sm);padding:12px;text-align:center;"><div style="font-size:22px;font-weight:700;color:var(--amber);">30%</div><strong>Lazer</strong><br><span style="font-size:11px;">Entretenimento e prazer</span></div>
+                        <div style="background:var(--blue-light);border-radius:var(--radius-sm);padding:12px;text-align:center;"><div style="font-size:22px;font-weight:700;color:var(--blue);">20%</div><strong>Investimento</strong><br><span style="font-size:11px;">Reserva e crescimento</span></div>
+                    </div>
+                    <p>No <strong>Dashboard</strong> você vê as barras de progresso do mês atual. Na aba <strong>DRE → Histórico</strong>, clique no badge de status de qualquer mês para ver o diagnóstico detalhado com o que precisa melhorar.</p>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 5 -->
+            <div id="sec5" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">5</span> Dívidas</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">Na aba <strong>Patrimônio → Controle de Dívidas</strong> cadastre todos os seus compromissos financeiros.</p>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;">
+                        <strong>📝 O que cadastrar:</strong><br>
+                        • Nome da dívida (ex: Financiamento Carro)<br>
+                        • Valor total da dívida<br>
+                        • Valor da parcela mensal<br>
+                        • Total de parcelas e parcelas restantes<br>
+                        • Taxa de juros ao mês (se houver)
+                    </div>
+                    <p>O sistema mostra o <strong>total a pagar</strong>, <strong>total de juros</strong> e uma barra de progresso de quitação. Quando uma dívida for quitada, exclua ela do sistema.</p>
+                    <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;margin-top:10px;">
+                        <strong style="color:var(--accent-dark);">💡 Dica:</strong> Dívidas cadastradas entram automaticamente na projeção dos próximos 6 meses e influenciam seu Score Financeiro.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 6 -->
+            <div id="sec6" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">6</span> Planejamento</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">A aba <strong>Planejamento</strong> tem três áreas:</p>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:8px;">
+                        <strong>📊 Projeção de Saldo — Próximos 6 Meses</strong><br>
+                        Com base na sua média dos últimos 3 meses e nos lançamentos recorrentes, o sistema projeta se você terá dinheiro suficiente nos próximos meses. Meses com déficit aparecem destacados em vermelho.
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:8px;">
+                        <strong>🔁 Lançamentos Recorrentes</strong><br>
+                        Cadastre contas fixas mensais (aluguel, internet, salário fixo). Elas entram na projeção automaticamente. Informe o dia do mês em que costumam ocorrer.
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;">
+                        <strong>🎯 Metas e Objetivos</strong><br>
+                        Defina sua meta de reserva de emergência (ideal: 6x seus gastos mensais) e adicione objetivos como viagem, carro, imóvel. O sistema calcula em quantos meses você consegue realizá-los com sua sobra mensal atual.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 7 -->
+            <div id="sec7" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">7</span> Score Financeiro</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">O <strong>Score</strong> é uma pontuação de 0 a 100 que avalia sua saúde financeira com base em 4 critérios:</p>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:10px;"><strong>Regra 50/30/20</strong><br><span style="font-size:11px;color:var(--text3);">Até 30 pontos</span></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:10px;"><strong>Reserva de Emergência</strong><br><span style="font-size:11px;color:var(--text3);">Até 25 pontos</span></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:10px;"><strong>Controle de Dívidas</strong><br><span style="font-size:11px;color:var(--text3);">Até 25 pontos</span></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:10px;"><strong>Consistência (3 meses)</strong><br><span style="font-size:11px;color:var(--text3);">Até 20 pontos</span></div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:11px;text-align:center;">
+                        <div style="background:var(--accent-light);padding:8px;border-radius:var(--radius-sm);"><strong style="color:var(--accent);">80-100</strong><br>🏆 Excelente</div>
+                        <div style="background:var(--blue-light);padding:8px;border-radius:var(--radius-sm);"><strong style="color:var(--blue);">60-79</strong><br>👍 Bom</div>
+                        <div style="background:var(--amber-light);padding:8px;border-radius:var(--radius-sm);"><strong style="color:var(--amber);">40-59</strong><br>⚠️ Regular</div>
+                        <div style="background:var(--red-light);padding:8px;border-radius:var(--radius-sm);"><strong style="color:var(--red);">0-39</strong><br>❗ Crítico</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 8 -->
+            <div id="sec8" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">8</span> DRE — Demonstração do Resultado</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <p style="margin-bottom:10px;">A aba <strong>DRE</strong> é o relatório financeiro completo do seu período.</p>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;">
+                        <strong>📅 Filtros disponíveis:</strong><br>
+                        • <strong>Mês específico</strong> — veja os resultados de um mês exato<br>
+                        • <strong>Intervalo de meses</strong> — ex: janeiro a junho para ver o semestre
+                    </div>
+                    <p style="margin-bottom:10px;">No <strong>Histórico de Competências</strong>, cada linha representa um mês. Clique no badge <strong>Status</strong> para ver o diagnóstico detalhado daquele mês — o que estava dentro e fora das metas.</p>
+                    <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;">
+                        <strong style="color:var(--accent-dark);">💡 Dica:</strong> Use o DRE no final de cada mês para fazer sua revisão financeira e identificar onde pode melhorar.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 9 -->
+            <div id="sec9" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">9</span> Segurança e PIN</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;">
+                        <strong>⚙️ Como configurar o PIN:</strong><br>
+                        1. Clique no ícone de engrenagem (⚙️) no canto superior direito<br>
+                        2. Vá em "PIN de Segurança"<br>
+                        3. Como é a primeira vez, deixe o campo "PIN Atual" em branco<br>
+                        4. Digite seu novo PIN de 8 dígitos numéricos<br>
+                        5. Confirme e clique em "Salvar PIN"
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-bottom:10px;">
+                        <strong>🔒 O PIN protege:</strong><br>
+                        • O acesso ao sistema após o login Google<br>
+                        • A aba Patrimônio (pode ser ativado/desativado nas configurações)
+                    </div>
+                    <div style="background:var(--amber-light);border-radius:var(--radius-sm);padding:12px;">
+                        <strong style="color:var(--amber);">⚠️ Importante:</strong> Guarde seu PIN em local seguro. Não há recuperação automática — se esquecer, entre em contato com o suporte.
+                    </div>
+                    <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;margin-top:10px;">
+                        <strong>👁️ Ocultar Saldos:</strong> Clique no botão "Ocultar" no header para esconder todos os valores com *** — útil quando estiver em público.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEÇÃO 10 -->
+            <div id="sec10" style="margin-bottom:28px;">
+                <div style="font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;"><span style="background:var(--accent);color:white;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">10</span> Dicas Gerais</div>
+                <div style="font-size:13px;color:var(--text2);line-height:1.8;">
+                    <div style="display:flex;flex-direction:column;gap:10px;">
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">📅</span><div><strong>Lance diariamente</strong><br>O hábito de registrar todo dia é o segredo do controle financeiro. Quanto mais consistente, mais precisa fica a projeção.</div></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">🎨</span><div><strong>Personalize as cores</strong><br>Nas configurações (⚙️) você pode escolher entre 6 temas de cores diferentes para deixar o sistema com a sua cara.</div></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">📱</span><div><strong>Use no celular</strong><br>O MoneyMap funciona perfeitamente no celular. Adicione o site à tela inicial para acesso rápido como um app.</div></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">🌙</span><div><strong>Modo escuro</strong><br>Clique em "Modo escuro" no header para alternar entre o tema claro e escuro.</div></div>
+                        <div style="background:var(--bg);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">📊</span><div><strong>Revise mensalmente</strong><br>Todo início do mês, acesse o DRE do mês anterior e o Dashboard para ver sua evolução. Ajuste metas se necessário.</div></div>
+                        <div style="background:var(--accent-light);border-radius:var(--radius-sm);padding:12px;display:flex;gap:10px;"><span style="font-size:20px;">🏆</span><div><strong style="color:var(--accent-dark);">Meta principal</strong><br>Mantenha o Score acima de 80 por 3 meses consecutivos. Isso significa que você está no caminho certo para a independência financeira!</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <div style="text-align:center;padding:20px;background:var(--accent-light);border-radius:var(--radius-sm);">
+                <div style="font-size:18px;font-weight:700;color:var(--accent-dark);margin-bottom:4px;">🗺️ MoneyMap</div>
+                <div style="font-size:13px;color:var(--accent-dark);">Seu mapa financeiro pessoal. Controle, planeje e conquiste.</div>
+            </div>
+        </div>
+    </div>
+
+</div>
+</div>
+
+<!-- MODAIS -->
+
+<!-- Modal PIN Patrimônio -->
+<div id="modalPinPatrimonio" class="modal-overlay hidden">
+    <div class="modal" style="max-width:340px;text-align:center;">
+        <div style="font-size:32px;margin-bottom:12px;">🔒</div>
+        <h3 style="margin-bottom:8px;">Área Protegida</h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:20px;">Digite seu PIN de 8 dígitos para acessar o Patrimônio</p>
+        <div id="pinPatrimonioDisplay" style="display:flex;gap:10px;justify-content:center;margin-bottom:12px;"></div>
+        <div id="pinPatrimonioErro" style="color:var(--red);font-size:12px;margin-bottom:12px;min-height:18px;"></div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:200px;margin:0 auto 16px;">
+            <button onclick="pinPatrimonioDigito(1)" class="pin-key">1</button>
+            <button onclick="pinPatrimonioDigito(2)" class="pin-key">2</button>
+            <button onclick="pinPatrimonioDigito(3)" class="pin-key">3</button>
+            <button onclick="pinPatrimonioDigito(4)" class="pin-key">4</button>
+            <button onclick="pinPatrimonioDigito(5)" class="pin-key">5</button>
+            <button onclick="pinPatrimonioDigito(6)" class="pin-key">6</button>
+            <button onclick="pinPatrimonioDigito(7)" class="pin-key">7</button>
+            <button onclick="pinPatrimonioDigito(8)" class="pin-key">8</button>
+            <button onclick="pinPatrimonioDigito(9)" class="pin-key">9</button>
+            <div></div>
+            <button onclick="pinPatrimonioDigito(0)" class="pin-key">0</button>
+            <button onclick="pinPatrimonioApagar()" class="pin-key" style="font-size:16px;">⌫</button>
+        </div>
+        <button class="btn btn-outline" onclick="fecharPinPatrimonio()" style="width:100%;">Cancelar</button>
+    </div>
+</div>
+
+<!-- Modal Configurações -->
+<div id="modalConfiguracoes" class="modal-overlay hidden">
+    <div class="modal" style="max-width:440px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+            <h3><i class="fa-solid fa-gear" style="color:var(--accent);margin-right:8px;"></i>Configurações</h3>
+            <button onclick="fecharConfiguracoes()" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:18px;">✕</button>
+        </div>
+        <div style="font-size:13px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:12px;">🎨 Tema de Cores</div>
+        <div id="temasContainer" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;padding:14px;background:var(--bg);border-radius:var(--radius-sm);"></div>
+        <div style="font-size:13px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:12px;">🔐 PIN de Segurança (8 dígitos)</div>
+        <div class="form-group" style="margin-bottom:10px;">
+            <label>PIN Atual (deixe em branco se não tem)</label>
+            <input type="password" id="configSenhaAtual" maxlength="8" inputmode="numeric" pattern="[0-9]*" placeholder="••••••••">
+        </div>
+        <div class="form-group" style="margin-bottom:10px;">
+            <label>Novo PIN (8 dígitos)</label>
+            <input type="password" id="configSenhaNova" maxlength="8" inputmode="numeric" pattern="[0-9]*" placeholder="••••••••">
+        </div>
+        <div class="form-group" style="margin-bottom:10px;">
+            <label>Confirmar Novo PIN</label>
+            <input type="password" id="configSenhaConfirmar" maxlength="8" inputmode="numeric" pattern="[0-9]*" placeholder="••••••••">
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin:16px 0;padding:12px;background:var(--bg);border-radius:var(--radius-sm);">
+            <input type="checkbox" id="configPatrimonioLock" style="width:18px;height:18px;">
+            <label for="configPatrimonioLock" style="font-size:13px;font-weight:500;cursor:pointer;">Exigir PIN para acessar a aba Patrimônio</label>
+        </div>
+        <div id="configSenhaStatus" style="font-size:13px;min-height:20px;margin-bottom:12px;"></div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" onclick="removerSenha()" id="btnRemoverSenha"><i class="fa-solid fa-trash"></i> Remover PIN</button>
+            <button class="btn btn-outline" onclick="fecharConfiguracoes()">Cancelar</button>
+            <button class="btn btn-primary" onclick="salvarSenha()"><i class="fa-solid fa-check"></i> Salvar PIN</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Transferência -->
+<div id="modalTransferencia" class="modal-overlay hidden">
+    <div class="modal" style="max-width:420px;">
+        <h3><i class="fa-solid fa-right-left" style="color:var(--accent);margin-right:8px;"></i>Transferência entre Contas</h3>
+        <div class="form-group" style="margin-top:12px;"><label>Conta Origem (de onde sai)</label><select id="transContaOrigem"></select></div>
+        <div style="text-align:center;font-size:20px;margin:8px 0;">⬇️</div>
+        <div class="form-group"><label>Conta Destino (para onde vai)</label><select id="transContaDestino"></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Valor (R$)</label><input type="number" id="transValor" step="0.01" placeholder="0,00"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Descrição</label><input type="text" id="transDescricao" placeholder="Ex: Reserva para poupança..."></div>
+        <div class="form-group" style="margin-top:10px;"><label>Data</label><input type="date" id="transData"></div>
+        <div class="modal-actions">
+            <button class="btn btn-outline" onclick="fecharModalTransferencia()">Cancelar</button>
+            <button class="btn btn-primary" onclick="salvarTransferencia()"><i class="fa-solid fa-check"></i> Transferir</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Status -->
+<div id="modalStatus" class="modal-overlay hidden" onclick="if(event.target===this)fecharModalStatus()">
+    <div class="modal" style="max-width:500px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+            <h3 style="font-size:17px;"><i class="fa-solid fa-chart-pie" style="color:var(--accent);margin-right:8px;"></i><span id="modalStatusTitulo"></span></h3>
+            <button onclick="fecharModalStatus()" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:18px;">✕</button>
+        </div>
+        <div id="modalStatusCorpo"></div>
+        <div style="margin-top:16px;text-align:right;"><button class="btn btn-primary" onclick="fecharModalStatus()">Fechar</button></div>
+    </div>
+</div>
+
+<!-- Modal Editar Lançamento -->
+<div id="modalEditar" class="modal-overlay hidden">
+    <div class="modal">
+        <h3><i class="fa-solid fa-pen" style="color:var(--accent);margin-right:8px;"></i>Editar Lançamento</h3>
+        <div class="form-group"><label>Descrição</label><input type="text" id="editDescricao"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Valor (R$)</label><input type="number" id="editValor" step="0.01"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Tipo</label><select id="editTipo" onchange="carregarCategoriasEdit()"><option value="entrada">Entrada</option><option value="saida">Saída</option></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Categoria</label><select id="editCategoria"></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Conta</label><select id="editContaLanc"></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Data</label><input type="date" id="editDataEvento"></div>
+        <div class="modal-actions">
+            <button class="btn btn-outline" onclick="fecharModalEditar()">Cancelar</button>
+            <button class="btn btn-primary" id="btnSalvarEdicao" onclick="salvarEdicao()"><i class="fa-solid fa-check"></i> Salvar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Conta -->
+<div id="modalConta" class="modal-overlay hidden">
+    <div class="modal">
+        <h3><i class="fa-solid fa-building-columns" style="color:var(--accent);margin-right:8px;"></i><span id="modalContaTitulo">Nova Conta</span></h3>
+        <div class="form-group"><label>Nome da Conta</label><input type="text" id="contaNome" placeholder="Ex: Nubank, Bradesco..."></div>
+        <div class="form-group" style="margin-top:10px;"><label>Tipo</label><select id="contaTipo" onchange="onChangeTipoConta()"><option value="corrente">Conta Corrente</option><option value="poupanca">Poupança</option><option value="cartao">Cartão de Crédito</option><option value="investimento">Investimento</option></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Saldo Atual (R$)</label><input type="number" id="contaSaldo" step="0.01" placeholder="0,00"></div>
+        <div id="contaLimiteRow" class="form-group" style="margin-top:10px;display:none;"><label>Limite do Cartão (R$)</label><input type="number" id="contaLimite" step="0.01" placeholder="0,00"></div>
+        <div id="contaCartaoRows" style="display:none;">
+            <div class="form-group" style="margin-top:10px;"><label>Dia de Vencimento</label><input type="number" id="contaVencimento" placeholder="Ex: 10" min="1" max="31"></div>
+            <div class="form-group" style="margin-top:10px;"><label>Dia de Fechamento</label><input type="number" id="contaFechamento" placeholder="Ex: 3" min="1" max="31"></div>
+        </div>
+        <div style="margin-top:14px;padding:12px;background:var(--amber-light);border-radius:var(--radius-sm);border:1px solid var(--amber);">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <input type="checkbox" id="contaComprometida" style="width:16px;height:16px;" onchange="document.getElementById('contaComprometidaValor').style.display=this.checked?'block':'none'">
+                <label for="contaComprometida" style="font-size:13px;font-weight:600;color:var(--amber);cursor:pointer;">⚠️ Conta Comprometida (não entra no controle pessoal)</label>
+            </div>
+            <div id="contaComprometidaValor" style="display:none;">
+                <div class="form-group"><label>Minha parte mensal (R$)</label><input type="number" id="contaValorComprometido" step="0.01" placeholder="Ex: 300,00 (minha parte no financiamento)"></div>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" id="btnExcluirConta" style="display:none;margin-right:auto;"><i class="fa-solid fa-trash"></i> Excluir</button>
+            <button class="btn btn-outline" onclick="fecharModalConta()">Cancelar</button>
+            <button class="btn btn-primary" onclick="salvarConta()"><i class="fa-solid fa-check"></i> Salvar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Dívida -->
+<div id="modalDivida" class="modal-overlay hidden">
+    <div class="modal">
+        <h3><i class="fa-solid fa-hand-holding-dollar" style="color:var(--red);margin-right:8px;"></i><span id="modalDividaTitulo">Nova Dívida</span></h3>
+        <div class="form-group"><label>Nome / Descrição</label><input type="text" id="dividaNome" placeholder="Ex: Financiamento carro, Empréstimo..."></div>
+        <div class="form-group" style="margin-top:10px;"><label>Valor Total da Dívida (R$)</label><input type="number" id="dividaTotal" step="0.01" placeholder="0,00"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Valor da Parcela (R$)</label><input type="number" id="dividaParcela" step="0.01" placeholder="0,00"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Total de Parcelas</label><input type="number" id="dividaParcelas" placeholder="Ex: 48"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Parcelas Restantes</label><input type="number" id="dividaParcelasRestantes" placeholder="Ex: 30"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Taxa de Juros (% ao mês)</label><input type="number" id="dividaJuros" step="0.01" placeholder="0,00" value="0"></div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" id="btnExcluirDivida" style="display:none;margin-right:auto;"><i class="fa-solid fa-trash"></i> Excluir</button>
+            <button class="btn btn-outline" onclick="fecharModalDivida()">Cancelar</button>
+            <button class="btn btn-primary" onclick="salvarDivida()"><i class="fa-solid fa-check"></i> Salvar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Recorrente -->
+<div id="modalRec" class="modal-overlay hidden">
+    <div class="modal">
+        <h3><i class="fa-solid fa-rotate" style="color:var(--accent);margin-right:8px;"></i><span id="modalRecTitulo">Novo Lançamento Recorrente</span></h3>
+        <div class="form-group"><label>Nome</label><input type="text" id="recNome" placeholder="Ex: Aluguel, Internet, Salário..."></div>
+        <div class="form-group" style="margin-top:10px;"><label>Valor (R$)</label><input type="number" id="recValor" step="0.01" placeholder="0,00"></div>
+        <div class="form-group" style="margin-top:10px;"><label>Tipo</label><select id="recTipo"><option value="saida">Saída</option><option value="entrada">Entrada</option></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Categoria</label><select id="recCategoria"><option value="gasto fixo">Gasto Fixo</option><option value="gasto variável">Gasto Variável</option><option value="lazer">Lazer</option><option value="investimento">Investimento</option><option value="receita">Receita</option></select></div>
+        <div class="form-group" style="margin-top:10px;"><label>Dia do Mês</label><input type="number" id="recDia" placeholder="Ex: 5" min="1" max="31"></div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" id="btnExcluirRec" style="display:none;margin-right:auto;"><i class="fa-solid fa-trash"></i> Excluir</button>
+            <button class="btn btn-outline" onclick="fecharModalRec()">Cancelar</button>
+            <button class="btn btn-primary" onclick="salvarRecorrente()"><i class="fa-solid fa-check"></i> Salvar</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>
