@@ -146,8 +146,6 @@
             const descricao = document.getElementById('descricao').value.trim();
             const valor = parseFloat(document.getElementById('valor').value);
             const tipo = document.getElementById('tipo').value;
-            const categoria = document.getElementById('categoria').value;
-            const contaId = document.getElementById('contaLanc').value;
             let dataEvento = document.getElementById('dataEvento').value;
             if (!descricao){ toast('Descrição obrigatória','error'); return; }
             if (isNaN(valor)||valor<=0){ toast('Valor inválido','error'); return; }
@@ -155,16 +153,37 @@
             const btn = document.querySelector('.btn-add');
             btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
             try {
-                const novo = {descricao, valor, tipo, categoria, contaId: contaId||'', dataEvento, criadoEm: new Date().toISOString()};
-                const dr = await addDoc(ref('lancamentos'), novo);
-                lancamentos.unshift({id:dr.id,...novo});
-                // Compensação automática de conta
-                if(contaId) await compensarConta(contaId, valor, tipo);
+                if(tipo === 'transferencia'){
+                    // TRANSFERÊNCIA ENTRE CONTAS
+                    const origem = document.getElementById('transOrigem').value;
+                    const destino = document.getElementById('transDestino').value;
+                    if(!origem||!destino){ toast('Selecione as contas','error'); btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-plus"></i> Adicionar'; return; }
+                    if(origem===destino){ toast('Contas precisam ser diferentes','error'); btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-plus"></i> Adicionar'; return; }
+                    // Lança saída na origem
+                    const saida={descricao:`${descricao||'Transferência'} (saída)`,valor,tipo:'saida',categoria:'transferência',contaId:origem,dataEvento,criadoEm:new Date().toISOString(),transferencia:true};
+                    const dr1=await addDoc(ref('lancamentos'),saida);
+                    lancamentos.unshift({id:dr1.id,...saida});
+                    await compensarConta(origem,valor,'saida');
+                    // Lança entrada no destino
+                    const entrada={descricao:`${descricao||'Transferência'} (entrada)`,valor,tipo:'entrada',categoria:'transferência',contaId:destino,dataEvento,criadoEm:new Date().toISOString(),transferencia:true};
+                    const dr2=await addDoc(ref('lancamentos'),entrada);
+                    lancamentos.unshift({id:dr2.id,...entrada});
+                    await compensarConta(destino,valor,'entrada');
+                    toast('Transferência realizada!');
+                } else {
+                    // LANÇAMENTO NORMAL
+                    const categoria = document.getElementById('categoria').value;
+                    const contaId = document.getElementById('contaLanc').value;
+                    const novo = {descricao, valor, tipo, categoria, contaId: contaId||'', dataEvento, criadoEm: new Date().toISOString()};
+                    const dr = await addDoc(ref('lancamentos'), novo);
+                    lancamentos.unshift({id:dr.id,...novo});
+                    if(contaId) await compensarConta(contaId, valor, tipo);
+                    toast('Lançamento adicionado!');
+                }
                 document.getElementById('descricao').value='';
                 document.getElementById('valor').value='';
                 document.getElementById('dataEvento').value=new Date().toISOString().slice(0,10);
                 renderizarTudo();
-                toast('Lançamento adicionado!');
                 verificarAlertas();
             } catch(e){ toast('Erro ao salvar.','error'); }
             btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-plus"></i> Adicionar';
@@ -238,8 +257,7 @@
                 document.getElementById('contaLimite').value=c.limite||'';
                 document.getElementById('contaVencimento').value=c.vencimento||'';
                 document.getElementById('contaFechamento').value=c.fechamento||'';
-                document.getElementById('contaComprometida').checked=c.comprometida||false;
-                document.getElementById('contaValorComprometido').value=c.valorComprometido||'';
+
                 document.getElementById('contaLimiteRow').style.display=c.tipo==='cartao'?'flex':'none';
                 document.getElementById('contaCartaoRows').style.display=c.tipo==='cartao'?'flex':'none';
                 document.getElementById('btnExcluirConta').style.display='inline-flex';
@@ -252,8 +270,7 @@
                 document.getElementById('contaSaldo').value='';
                 document.getElementById('contaLimite').value='';
                 document.getElementById('contaVencimento').value='';
-                document.getElementById('contaComprometida').checked=false;
-                document.getElementById('contaValorComprometido').value='';
+
                 document.getElementById('contaFechamento').value='';
                 document.getElementById('contaLimiteRow').style.display='none';
                 document.getElementById('contaCartaoRows').style.display='none';
@@ -276,11 +293,9 @@
             const limite=parseFloat(document.getElementById('contaLimite').value)||0;
             const vencimento=parseInt(document.getElementById('contaVencimento').value)||0;
             const fechamento=parseInt(document.getElementById('contaFechamento').value)||0;
-            const comprometida=document.getElementById('contaComprometida').checked;
-            const valorComprometido=parseFloat(document.getElementById('contaValorComprometido').value)||0;
             if(!nome){ toast('Nome obrigatório','error'); return; }
             const editId = document.getElementById('modalConta').dataset.editId;
-            const dados={nome,tipo,saldo,limite,vencimento,fechamento,comprometida,valorComprometido};
+            const dados={nome,tipo,saldo,limite,vencimento,fechamento};
             try {
                 if(editId) {
                     await updateDoc(docRef('contas',editId),dados);
@@ -437,6 +452,21 @@
         };
 
         // ===== FILTROS =====
+        window.onChangeTipoLanc = () => {
+            const tipo = document.getElementById('tipo').value;
+            const isTransf = tipo === 'transferencia';
+            // Mostra/oculta campos
+            document.getElementById('grupoCategoria').style.display = isTransf ? 'none' : '';
+            document.getElementById('grupoConta').style.display = isTransf ? 'none' : '';
+            document.getElementById('grupoTransferencia').style.display = isTransf ? 'block' : 'none';
+            if(isTransf){
+                preencherSelectContas('transOrigem');
+                preencherSelectContas('transDestino');
+            } else {
+                carregarCategorias();
+            }
+        };
+
         window.renderizarTabela = renderizarTabela;
         window.filtrarLancamentos = (tipo) => {
             filtroAtivo=tipo;
@@ -648,11 +678,9 @@
         // ===== RENDERIZAÇÃO =====
         function atualizarSaldo() {
             const {entradas,saidas,saldo}=calcularTotais();
-            // Patrimônio = APENAS soma dos saldos das contas (não comprometidas)
-            // O saldo dos lançamentos já está refletido nas contas via compensação automática
-            // Se não há contas cadastradas, usa o saldo dos lançamentos como fallback
-            const contasNormais=contas.filter(c=>!c.comprometida&&c.tipo!=='cartao');
-            const totalContas=contasNormais.reduce((a,b)=>a+b.saldo,0);
+            // Patrimônio = soma dos saldos das contas (exceto cartão)
+            // Se não há contas, usa saldo dos lançamentos
+            const totalContas=contas.filter(c=>c.tipo!=='cartao').reduce((a,b)=>a+b.saldo,0);
             const patrimonio=contas.length>0?totalContas:saldo;
             // SEMPRE salva os valores reais no mapa
             valoresOriginais['saldoTotal']=fmt(saldo);
@@ -697,12 +725,8 @@
         function renderizarContas() {
             const el=document.getElementById('contasGrid'); if(!el) return;
             if(contas.length===0){el.innerHTML='<div style="color:var(--text3);font-size:13px;padding:20px 0;">Nenhuma conta cadastrada.</div>';return;}
-            // Separar normais e comprometidas
-            const normais=contas.filter(c=>!c.comprometida);
-            const comprometidas=contas.filter(c=>c.comprometida);
-            const renderCard=(c)=>`
-                <div style="background:var(--bg);border:1px solid ${c.comprometida?'var(--amber)':'var(--border)'};border-radius:var(--radius-sm);padding:16px;cursor:pointer;position:relative;" onclick="abrirModalConta('${c.id}')">
-                    ${c.comprometida?'<div style="position:absolute;top:8px;right:8px;font-size:10px;font-weight:700;background:var(--amber-light);color:var(--amber);padding:2px 8px;border-radius:999px;">COMPROMETIDA</div>':''}
+            el.innerHTML=contas.map(c=>`
+                <div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px;cursor:pointer;" onclick="abrirModalConta('${c.id}')">
                     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
                         <div>
                             <div style="font-size:13px;font-weight:700;">${escapeHtml(c.nome)}</div>
@@ -711,19 +735,13 @@
                         <div style="font-size:18px;">${c.tipo==='corrente'?'🏦':c.tipo==='poupanca'?'💰':c.tipo==='cartao'?'💳':'📈'}</div>
                     </div>
                     <div class="saldo-conta" data-valor="${fmt(c.saldo)}" style="font-size:18px;font-weight:700;color:${c.saldo>=0?'var(--accent)':'var(--red)'};">${saldosVisiveis?fmt(c.saldo):'***'}</div>
-                    ${c.comprometida&&c.valorComprometido?`<div style="font-size:11px;color:var(--amber);margin-top:4px;">🔒 Minha parte: <span class="saldo-comprometida" data-valor="${fmt(c.valorComprometido)}">${saldosVisiveis?fmt(c.valorComprometido):'***'}</span>/mês</div>`:''}
                     ${c.tipo==='cartao'&&c.limite?`<div style="font-size:11px;color:var(--text3);margin-top:4px;">Limite: ${fmt(c.limite)} · Vence dia ${c.vencimento||'—'}</div>`:''}
-                </div>`;
-            let html='';
-            if(normais.length>0) html+=normais.map(renderCard).join('');
-            if(comprometidas.length>0) html+=`<div style="grid-column:1/-1;margin-top:12px;margin-bottom:4px;font-size:12px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:.04em;">⚠️ Contas Comprometidas — não entram no controle pessoal</div>`+comprometidas.map(renderCard).join('');
-            el.innerHTML=html;
-            // PL pessoal (só contas não comprometidas)
-            const plPessoal=normais.filter(c=>c.tipo!=='cartao').reduce((a,b)=>a+b.saldo,0);
-            valoresOriginais['plPessoal']=fmt(plPessoal);
+                </div>`).join('');
+            // PL = soma de todas as contas não cartão
+            const pl=contas.filter(c=>c.tipo!=='cartao').reduce((a,b)=>a+b.saldo,0);
+            valoresOriginais['plPessoal']=fmt(pl);
             const plEl=document.getElementById('plPessoal');
-            if(plEl) plEl.innerText=saldosVisiveis?fmt(plPessoal):'***';
-            // Aplicar visibilidade nos cards recém-renderizados
+            if(plEl) plEl.innerText=saldosVisiveis?fmt(pl):'***';
             setTimeout(()=>aplicarVisibilidadeSaldos(),0);
         }
 
@@ -1458,11 +1476,25 @@
             <div class="form-grid">
                 <div class="form-group"><label>Descrição</label><input type="text" id="descricao" placeholder="Ex: Honorários, Mercado..."></div>
                 <div class="form-group"><label>Valor (R$)</label><input type="number" id="valor" step="0.01" placeholder="0,00"></div>
-                <div class="form-group"><label>Tipo</label><select id="tipo"><option value="entrada">Entrada</option><option value="saida">Saída</option></select></div>
-                <div class="form-group"><label>Categoria</label><select id="categoria"></select></div>
-                <div class="form-group"><label>Conta</label><select id="contaLanc"></select></div>
+                <div class="form-group"><label>Tipo</label>
+                    <select id="tipo" onchange="onChangeTipoLanc()">
+                        <option value="entrada">Entrada</option>
+                        <option value="saida">Saída</option>
+                        <option value="transferencia">Transferência entre Contas</option>
+                    </select>
+                </div>
+                <div class="form-group" id="grupoCategoria"><label>Categoria</label><select id="categoria"></select></div>
+                <div class="form-group" id="grupoConta"><label>Conta</label><select id="contaLanc"></select></div>
                 <div class="form-group"><label>Data</label><input type="date" id="dataEvento"></div>
                 <button class="btn btn-primary btn-add" onclick="adicionarLancamento()"><i class="fa-solid fa-plus"></i> Adicionar</button>
+            </div>
+            <!-- Linha extra para transferência -->
+            <div id="grupoTransferencia" style="display:none;margin-top:12px;display:none;">
+                <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:end;">
+                    <div class="form-group"><label>Conta de Origem (de onde sai)</label><select id="transOrigem"></select></div>
+                    <div style="font-size:22px;text-align:center;padding-bottom:6px;">→</div>
+                    <div class="form-group"><label>Conta de Destino (para onde vai)</label><select id="transDestino"></select></div>
+                </div>
             </div>
         </div>
         <div class="filtros">
@@ -1871,22 +1903,7 @@
     </div>
 </div>
 
-<!-- Modal Transferência -->
-<div id="modalTransferencia" class="modal-overlay hidden">
-    <div class="modal" style="max-width:420px;">
-        <h3><i class="fa-solid fa-right-left" style="color:var(--accent);margin-right:8px;"></i>Transferência entre Contas</h3>
-        <div class="form-group" style="margin-top:12px;"><label>Conta Origem (de onde sai)</label><select id="transContaOrigem"></select></div>
-        <div style="text-align:center;font-size:20px;margin:8px 0;">⬇️</div>
-        <div class="form-group"><label>Conta Destino (para onde vai)</label><select id="transContaDestino"></select></div>
-        <div class="form-group" style="margin-top:10px;"><label>Valor (R$)</label><input type="number" id="transValor" step="0.01" placeholder="0,00"></div>
-        <div class="form-group" style="margin-top:10px;"><label>Descrição</label><input type="text" id="transDescricao" placeholder="Ex: Reserva para poupança..."></div>
-        <div class="form-group" style="margin-top:10px;"><label>Data</label><input type="date" id="transData"></div>
-        <div class="modal-actions">
-            <button class="btn btn-outline" onclick="fecharModalTransferencia()">Cancelar</button>
-            <button class="btn btn-primary" onclick="salvarTransferencia()"><i class="fa-solid fa-check"></i> Transferir</button>
-        </div>
-    </div>
-</div>
+
 
 <!-- Modal Status -->
 <div id="modalStatus" class="modal-overlay hidden" onclick="if(event.target===this)fecharModalStatus()">
@@ -1929,15 +1946,7 @@
             <div class="form-group" style="margin-top:10px;"><label>Dia de Vencimento</label><input type="number" id="contaVencimento" placeholder="Ex: 10" min="1" max="31"></div>
             <div class="form-group" style="margin-top:10px;"><label>Dia de Fechamento</label><input type="number" id="contaFechamento" placeholder="Ex: 3" min="1" max="31"></div>
         </div>
-        <div style="margin-top:14px;padding:12px;background:var(--amber-light);border-radius:var(--radius-sm);border:1px solid var(--amber);">
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-                <input type="checkbox" id="contaComprometida" style="width:16px;height:16px;" onchange="document.getElementById('contaComprometidaValor').style.display=this.checked?'block':'none'">
-                <label for="contaComprometida" style="font-size:13px;font-weight:600;color:var(--amber);cursor:pointer;">⚠️ Conta Comprometida (não entra no controle pessoal)</label>
-            </div>
-            <div id="contaComprometidaValor" style="display:none;">
-                <div class="form-group"><label>Minha parte mensal (R$)</label><input type="number" id="contaValorComprometido" step="0.01" placeholder="Ex: 300,00 (minha parte no financiamento)"></div>
-            </div>
-        </div>
+
         <div class="modal-actions">
             <button class="btn btn-danger" id="btnExcluirConta" style="display:none;margin-right:auto;"><i class="fa-solid fa-trash"></i> Excluir</button>
             <button class="btn btn-outline" onclick="fecharModalConta()">Cancelar</button>
